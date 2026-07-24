@@ -113,6 +113,21 @@ test("an unnamed worker starts as New thread and adopts the agent-generated name
   assert.equal(workerArgs.includes("--name"), false, "placeholder names must not become persisted Pi session names");
 });
 
+test("a newly initialized Pi RPC session may defer creating its reported JSONL file until the first prompt", async (t) => {
+  const h = await harness(t, { PI_AGENT_VIEW_FAKE_DEFER_SESSION_FILE: "1" });
+
+  const launched = await h.client.launch({ cwd: tmpdir() });
+  assert.equal(launched.state, "ready");
+  assert.ok(launched.sessionFile);
+  await assert.rejects(access(launched.sessionFile!), /ENOENT/);
+  assert.deepEqual(await h.client.transcript(launched.id), { entries: [], hasMore: false });
+
+  await h.client.sendMessage(launched.id, "prompt", "create the transcript");
+  await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.state === "ready");
+  await access(launched.sessionFile!);
+  assert.ok((await h.client.transcript(launched.id)).entries.length > 0);
+});
+
 test("supervisor reports worker failure without credentials or network access", async (t) => {
   const h = await harness(t);
   const launched = await h.client.launch({ cwd: tmpdir(), prompt: "fail" });

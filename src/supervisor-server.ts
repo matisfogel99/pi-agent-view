@@ -387,7 +387,7 @@ export class SupervisorServer {
       const stateResponse = await this.rpc(worker, { type: "get_state" });
       const data = isObject(stateResponse.data) ? stateResponse.data : undefined;
       if (typeof data?.sessionFile === "string") {
-        const sessionFile = await realpath(data.sessionFile);
+        const sessionFile = await resolveWorkerSessionFile(data.sessionFile, record, this.paths.sessionsDir);
         if (record.sessionFile && sessionFile !== record.sessionFile) throw new Error("Worker opened a different session than requested");
         record.sessionFile = sessionFile;
       }
@@ -473,6 +473,14 @@ export class SupervisorServer {
     if (!record.sessionFile) throw new Error("This thread has no persisted transcript");
     if (cursor && before) throw new Error("Transcript requests cannot use both since and before cursors");
     const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(MAX_TRANSCRIPT_PAGE, Math.floor(requestedLimit))) : 100;
+    try {
+      await lstat(record.sessionFile);
+    } catch (cause) {
+      const deferredEmptySession = (cause as NodeJS.ErrnoException).code === "ENOENT"
+        && record.sessionOrigin === "created" && this.workers.has(id) && !cursor && !before;
+      if (deferredEmptySession) return { entries: [], hasMore: false };
+      throw cause;
+    }
     return await readTranscriptPage(record.sessionFile, cursor, limit, before);
   }
 
@@ -855,6 +863,25 @@ async function git(cwd: string, args: string[], timeout = 5_000): Promise<{ stdo
     const detail = cause as Error & { stderr?: string };
     throw new Error(`git ${args.join(" ")} failed: ${detail.stderr?.trim() || detail.message}`);
   }
+}
+
+async function resolveWorkerSessionFile(reportedPath: string, record: ThreadSnapshot, sessionsRoot: string): Promise<string> {
+  if (!isAbsolute(reportedPath)) throw new Error("Worker reported a relative session path");
+  const absolutePath = resolve(reportedPath);
+  let sessionFile: string;
+  try {
+    sessionFile = await realpath(absolutePath);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== "ENOENT" || record.sessionOrigin !== "created") throw cause;
+    const canonicalParent = await realpath(dirname(absolutePath));
+    sessionFile = join(canonicalParent, basename(absolutePath));
+  }
+
+  if (record.sessionOrigin === "created") {
+    const managedSessionDir = await realpath(join(sessionsRoot, record.id));
+    if (!isPathInside(managedSessionDir, sessionFile)) throw new Error("Worker reported a session path outside its managed directory");
+  }
+  return sessionFile;
 }
 
 async function readSessionMetadata(inputPath: string): Promise<SessionMetadata> {

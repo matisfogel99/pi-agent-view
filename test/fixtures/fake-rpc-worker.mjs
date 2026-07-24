@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const args = process.argv.slice(2);
@@ -11,7 +11,8 @@ let autoNamePending = process.env.PI_AGENT_VIEW_AUTO_NAME === "1";
 if (process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG) appendFileSync(process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG, `${JSON.stringify(args)}\n`);
 mkdirSync(sessionDir, { recursive: true });
 const sessionFile = existingSession ?? join(sessionDir, "fake-session.jsonl");
-if (!existingSession) writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), ...(explicitName ? { name } : {}) })}\n`, { mode: 0o600 });
+const sessionHeader = `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), ...(explicitName ? { name } : {}) })}\n`;
+if (!existingSession && process.env.PI_AGENT_VIEW_FAKE_DEFER_SESSION_FILE !== "1") writeFileSync(sessionFile, sessionHeader, { mode: 0o600 });
 
 let buffer = "";
 let entrySequence = 0;
@@ -70,6 +71,7 @@ function runPrompt(message) {
     if (autoNamePending) {
       autoNamePending = false;
       name = `AI: ${message}`.slice(0, 80);
+      ensureSessionFile();
       appendFileSync(sessionFile, `${JSON.stringify({ type: "session_info", id: `entry-${process.pid}-${++entrySequence}`, parentId: null, timestamp: new Date().toISOString(), name })}\n`);
       send({ type: "session_info_changed", name });
     }
@@ -109,7 +111,12 @@ function runPrompt(message) {
   });
 }
 
+function ensureSessionFile() {
+  if (!existsSync(sessionFile)) writeFileSync(sessionFile, sessionHeader, { mode: 0o600 });
+}
+
 function appendMessage(role, content) {
+  ensureSessionFile();
   appendFileSync(sessionFile, `${JSON.stringify({ type: "message", id: `entry-${process.pid}-${++entrySequence}`, parentId: null, timestamp: new Date().toISOString(), message: { role, content } })}\n`);
 }
 
