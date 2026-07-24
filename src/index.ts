@@ -7,9 +7,13 @@ import type {
   DeleteThreadResult,
   LaunchThreadInput,
   SupervisorSnapshot,
+  ThreadMessageMode,
   ThreadSnapshot,
+  TranscriptPage,
+  UiResponseInput,
 } from "./protocol.ts";
 import { SupervisorClient } from "./supervisor-client.ts";
+import { TranscriptController } from "./transcript.ts";
 
 const STATUS_KEY = "agent-view";
 type ViewAction =
@@ -19,6 +23,8 @@ type ViewAction =
   | { type: "resume"; id: string }
   | { type: "delete"; id: string }
   | { type: "search"; query: string }
+  | { type: "preview"; id: string }
+  | { type: "attach"; id: string }
   | { type: "close" };
 
 export interface AgentViewSupervisor {
@@ -31,6 +37,10 @@ export interface AgentViewSupervisor {
   stop(id: string): Promise<ThreadSnapshot>;
   resume(id: string): Promise<ThreadSnapshot>;
   delete(id: string, confirmed: boolean): Promise<DeleteThreadResult>;
+  sendMessage(id: string, mode: ThreadMessageMode, message: string): Promise<ThreadSnapshot>;
+  answer(id: string, response: UiResponseInput): Promise<ThreadSnapshot>;
+  abort(id: string): Promise<ThreadSnapshot>;
+  transcript(id: string, cursor?: string, limit?: number, before?: string): Promise<TranscriptPage>;
 }
 
 type ClientFactory = () => AgentViewSupervisor;
@@ -138,6 +148,15 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
             if (query !== undefined) dashboard.setSearch(query);
             continue;
           }
+          if (action.type === "preview") {
+            const attach = await previewThread(ctx, supervisor, action.id);
+            if (attach) await takeoverThread(ctx, supervisor, action.id);
+            continue;
+          }
+          if (action.type === "attach") {
+            await takeoverThread(ctx, supervisor, action.id);
+            continue;
+          }
           if (action.type === "stop") {
             await supervisor.stop(action.id).catch((cause) => ctx.ui.notify(`Could not stop thread: ${errorMessage(cause)}`, "error"));
             continue;
@@ -218,7 +237,7 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
         const search = dashboard.searchQuery() ? `  filter: ${dashboard.searchQuery()}` : "";
         const lines = [
           theme.fg("accent", theme.bold("Pi Agent View")) + theme.fg("dim", `  ${grouping} / ${dashboard.preferences.sort}${search}`),
-          theme.fg("dim", "n new  a adopt  x stop  R resume  d delete  / search  g group  s sort  h/l collapse  q close"),
+          theme.fg("dim", "Space preview  Enter attach  n new  a adopt  x stop  R resume  d delete  / search  g group  q close"),
           "",
         ];
         const groups = dashboard.groups();
@@ -240,6 +259,7 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
         return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
       },
       invalidate() {},
+      dispose() { off(); },
       handleInput(data: string): void {
         const selected = dashboard.selected();
         if (matchesKey(data, Key.up) || data === "k") dashboard.move(-1);
@@ -248,6 +268,8 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
         else if (data === "g") dashboard.toggleGrouping();
         else if (data === "s") dashboard.toggleSort();
         else if (data === "/") finish({ type: "search", query: dashboard.searchQuery() });
+        else if ((matchesKey(data, Key.space)) && selected) finish({ type: "preview", id: selected.id });
+        else if (matchesKey(data, Key.enter) && selected) finish({ type: "attach", id: selected.id });
         else if (data === "n") finish({ type: "launch", cwd: selected?.cwd ?? ctx.cwd });
         else if (data === "a") finish({ type: "adopt" });
         else if (data === "x" && selected) finish({ type: "stop", id: selected.id });
@@ -259,6 +281,203 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
       },
     };
   });
+}
+
+async function previewThread(ctx: ExtensionContext, supervisor: AgentViewSupervisor, id: string): Promise<boolean> {
+  while (true) {
+    const action = await ctx.ui.custom<"back" | "attach" | "reply" | "abort">((tui, theme, _keys, done) => {
+      let thread = latestThread(id, dashboardSnapshot(supervisor));
+      let finished = false;
+      const off = supervisor.onSnapshot((snapshot) => {
+        thread = latestThread(id, snapshot);
+        tui.requestRender();
+      });
+      const finish = (value: "back" | "attach" | "reply" | "abort") => {
+        if (finished) return;
+        finished = true;
+        off();
+        done(value);
+      };
+      return {
+        render(width: number): string[] {
+          if (!thread) return [theme.fg("error", "Thread no longer exists")].map((line) => truncateToWidth(line, Math.max(1, width)));
+          const pending = thread.pendingRequest;
+          const content = thread.error
+            ? theme.fg("error", thread.error)
+            : pending
+              ? [pending.title, pending.message, pending.options?.length ? `Choices: ${pending.options.join(" · ")}` : undefined].filter(Boolean).join("\n")
+              : thread.recentOutput || thread.activity || "No output yet";
+          const lines = [
+            theme.fg("accent", theme.bold(thread.name)) + theme.fg("dim", `  ${thread.state}`),
+            theme.fg("dim", `${thread.project}  ·  ${thread.cwd}`),
+            "",
+            ...content.split("\n"),
+            "",
+            theme.fg("dim", "r reply  Enter attach  a abort worker  Space/Esc back"),
+          ];
+          return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
+        },
+        invalidate() {},
+        dispose() { off(); },
+        handleInput(data: string) {
+          if (data === "r") finish("reply");
+          else if (data === "a") finish("abort");
+          else if (matchesKey(data, Key.enter)) finish("attach");
+          else if (matchesKey(data, Key.space) || matchesKey(data, Key.escape) || data === "q") finish("back");
+          tui.requestRender();
+        },
+      };
+    });
+    if (action === "back" || !action) return false;
+    if (action === "attach") return true;
+    if (action === "abort") {
+      await supervisor.abort(id).catch((cause) => ctx.ui.notify(`Could not abort worker: ${errorMessage(cause)}`, "error"));
+      continue;
+    }
+    const snapshot = await supervisor.snapshot();
+    const thread = snapshot.threads.find((candidate) => candidate.id === id);
+    if (!thread) return false;
+    if (thread.state === "needs-input" && thread.pendingRequest) await answerPendingRequest(ctx, supervisor, thread);
+    else if (thread.state === "ready") await collectAndDeliver(ctx, supervisor, id, "prompt", "Reply to thread");
+    else ctx.ui.notify("Replies are available when the thread is ready or waiting for input", "warning");
+  }
+}
+
+async function takeoverThread(ctx: ExtensionContext, supervisor: AgentViewSupervisor, id: string): Promise<void> {
+  const transcript = new TranscriptController(200);
+  try { transcript.applyPage(await supervisor.transcript(id, undefined, 100)); }
+  catch (cause) { ctx.ui.notify(`Could not load transcript: ${errorMessage(cause)}`, "error"); return; }
+
+  while (true) {
+    const action = await ctx.ui.custom<"detach" | "prompt" | "steer" | "followUp" | "abort">((tui, theme, _keys, done) => {
+      let thread: ThreadSnapshot | undefined;
+      let finished = false;
+      let olderLoading = false;
+      let refreshing = false;
+      let refreshRequested = false;
+      const refresh = () => {
+        refreshRequested = true;
+        if (refreshing) return;
+        refreshing = true;
+        void (async () => {
+          while (refreshRequested && !finished) {
+            refreshRequested = false;
+            const page = await supervisor.transcript(id, transcript.cursor(), 100);
+            transcript.applyPage(page);
+            if (!finished) tui.requestRender();
+          }
+        })().catch((cause) => {
+          if (!finished) ctx.ui.notify(`Transcript update failed: ${errorMessage(cause)}`, "error");
+        }).finally(() => {
+          refreshing = false;
+          if (refreshRequested && !finished) refresh();
+        });
+      };
+      const loadOlder = () => {
+        if (olderLoading || !transcript.shouldLoadOlder() || !transcript.oldestCursor()) return;
+        olderLoading = true;
+        void supervisor.transcript(id, undefined, 100, transcript.oldestCursor()).then((page) => {
+          transcript.prependPage(page);
+          if (!finished) tui.requestRender();
+        }).catch((cause) => {
+          if (!finished) ctx.ui.notify(`Could not load older transcript entries: ${errorMessage(cause)}`, "error");
+        }).finally(() => { olderLoading = false; });
+      };
+      const off = supervisor.onSnapshot((snapshot) => {
+        thread = snapshot.threads.find((candidate) => candidate.id === id);
+        refresh();
+        tui.requestRender();
+      });
+      const finish = (value: "detach" | "prompt" | "steer" | "followUp" | "abort") => {
+        if (finished) return;
+        finished = true;
+        off();
+        done(value);
+      };
+      return {
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width);
+          const rows = Math.max(4, tui.terminal.rows - 5);
+          const header = theme.fg("accent", theme.bold(thread?.name ?? "Thread")) + theme.fg("dim", `  ${thread?.state ?? "loading"}`);
+          const body = transcript.render(safeWidth, rows);
+          if (thread?.state === "working" && thread.recentOutput) body.push(...thread.recentOutput.split("\n").slice(-3).map((line) => theme.fg("muted", `stream> ${line}`)));
+          const help = theme.fg("dim", "p prompt  s steer  f follow-up  a abort  ↑/↓ scroll  End latest  q detach");
+          return [header, ...body.slice(-rows), help].map((line) => truncateToWidth(line, safeWidth));
+        },
+        invalidate() {},
+        dispose() { off(); },
+        handleInput(data: string) {
+          if (data === "p") finish("prompt");
+          else if (data === "s") finish("steer");
+          else if (data === "f") finish("followUp");
+          else if (data === "a") finish("abort");
+          else if (matchesKey(data, Key.up) || data === "k") { transcript.scroll(1); loadOlder(); }
+          else if (matchesKey(data, Key.down) || data === "j") transcript.scroll(-1);
+          else if (matchesKey(data, Key.end)) transcript.followLatest();
+          else if (data === "q" || matchesKey(data, Key.escape)) finish("detach");
+          tui.requestRender();
+        },
+      };
+    });
+    if (!action || action === "detach") return;
+    if (action === "abort") {
+      await supervisor.abort(id).catch((cause) => ctx.ui.notify(`Could not abort worker: ${errorMessage(cause)}`, "error"));
+      continue;
+    }
+    await collectAndDeliver(ctx, supervisor, id, action, action === "followUp" ? "Queue follow-up" : action === "steer" ? "Steer running thread" : "Prompt thread");
+  }
+}
+
+async function answerPendingRequest(ctx: ExtensionContext, supervisor: AgentViewSupervisor, thread: ThreadSnapshot): Promise<void> {
+  const request = thread.pendingRequest!;
+  let response: UiResponseInput | undefined;
+  let retainedInput = "";
+  if (request.method === "select") {
+    const value = await ctx.ui.select(request.title ?? "Choose an option", request.options ?? []);
+    if (value === undefined) return;
+    retainedInput = value;
+    response = { requestId: request.id, value };
+  } else if (request.method === "confirm") {
+    const confirmed = await ctx.ui.confirm(request.title ?? "Confirm", request.message ?? "Continue?");
+    retainedInput = confirmed ? "Yes" : "No";
+    response = { requestId: request.id, confirmed };
+  } else if (request.method === "editor") {
+    const value = await ctx.ui.editor(request.title ?? "Reply", request.prefill ?? "");
+    if (value === undefined) return;
+    retainedInput = value;
+    response = { requestId: request.id, value };
+  } else {
+    const value = await ctx.ui.input(request.title ?? "Reply", request.placeholder ?? request.message ?? "");
+    if (value === undefined) return;
+    retainedInput = value;
+    response = { requestId: request.id, value };
+  }
+  try { await supervisor.answer(thread.id, response); }
+  catch (cause) { retainFailedInput(ctx, cause, retainedInput); }
+}
+
+async function collectAndDeliver(ctx: ExtensionContext, supervisor: AgentViewSupervisor, id: string, mode: ThreadMessageMode, title: string): Promise<void> {
+  const value = await ctx.ui.input(title, "Type a message");
+  if (value === undefined || !value.trim()) return;
+  try { await supervisor.sendMessage(id, mode, value); }
+  catch (cause) { retainFailedInput(ctx, cause, value); }
+}
+
+function retainFailedInput(ctx: ExtensionContext, cause: unknown, value: string): void {
+  ctx.ui.setEditorText(value);
+  ctx.ui.notify(`Input was not delivered and has been restored to the editor: ${errorMessage(cause)}`, "error");
+}
+
+function latestThread(id: string, snapshot: SupervisorSnapshot | undefined): ThreadSnapshot | undefined {
+  return snapshot?.threads.find((thread) => thread.id === id);
+}
+
+function dashboardSnapshot(supervisor: AgentViewSupervisor): SupervisorSnapshot | undefined {
+  // onSnapshot immediately supplies the current snapshot for real and in-memory adapters.
+  let current: SupervisorSnapshot | undefined;
+  const off = supervisor.onSnapshot((snapshot) => { current = snapshot; });
+  off();
+  return current;
 }
 
 async function adoptSession(ctx: ExtensionContext, supervisor: AgentViewSupervisor): Promise<void> {

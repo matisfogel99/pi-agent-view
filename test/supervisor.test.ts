@@ -48,7 +48,7 @@ test("client automatically starts the user-local supervisor on first use", async
   const client = new SupervisorClient({ paths: getSupervisorPaths(stateDir), connectTimeoutMs: 4_000 });
   t.after(() => client.disconnect());
   const snapshot = await client.connect();
-  assert.equal(snapshot.protocolVersion, 2);
+  assert.equal(snapshot.protocolVersion, 3);
   assert.ok(snapshot.supervisorPid > 0);
   await client.shutdownSupervisor();
 });
@@ -137,11 +137,46 @@ test("adoption, duplicate ownership, needs-input, resume, and safe deletion work
   await assert.rejects(access(waiting.sessionFile!));
 });
 
+test("interactive commands, UI answers, abort, and cursor-bounded transcripts work through the supervisor interface", async (t) => {
+  const h = await harness(t);
+  const launched = await h.client.launch({ cwd: tmpdir(), name: "Interactive", prompt: "choose" });
+  const waiting = await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.state === "needs-input");
+  assert.equal(waiting.pendingRequest?.method, "select");
+  assert.deepEqual(waiting.pendingRequest?.options, ["alpha", "beta"]);
+  assert.match(waiting.recentOutput ?? "", /deterministic output/, "preview output streams into bounded snapshot state");
+  await assert.rejects(h.client.answer(launched.id, { requestId: "ui-1", value: "invalid" }), /not available/);
+  assert.equal((await h.client.snapshot()).threads.find((thread) => thread.id === launched.id)?.state, "needs-input");
+
+  await h.client.answer(launched.id, { requestId: "ui-1", value: "alpha" });
+  await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.state === "ready");
+  const initialPage = await h.client.transcript(launched.id, undefined, 2);
+  assert.equal(initialPage.entries.length, 2);
+  assert.equal(initialPage.hasMore, true);
+  assert.ok(initialPage.startCursor);
+  assert.ok(initialPage.cursor);
+  const olderPage = await h.client.transcript(launched.id, undefined, 2, initialPage.startCursor);
+  assert.ok(olderPage.entries.length > 0, "older transcript pages remain reachable without unbounded client retention");
+
+  await h.client.sendMessage(launched.id, "prompt", "second run");
+  await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.state === "working");
+  await h.client.sendMessage(launched.id, "steer", "change direction");
+  await h.client.sendMessage(launched.id, "followUp", "then summarize");
+  await h.client.abort(launched.id);
+  await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.state === "ready");
+
+  const incremental = await h.client.transcript(launched.id, initialPage.cursor, 20);
+  const transcriptText = JSON.stringify(incremental.entries);
+  assert.match(transcriptText, /second run/);
+  assert.match(transcriptText, /change direction/);
+  assert.match(transcriptText, /then summarize/);
+  await h.client.stop(launched.id);
+});
+
 test("incompatible protocol versions are rejected clearly", async (t) => {
   const h = await harness(t);
   const incompatible = new SupervisorClient({ paths: h.paths, protocolVersion: 999, autoStart: false });
   t.after(() => incompatible.disconnect());
-  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 2/);
+  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 3/);
 });
 
 test("one supervisor owns the registry", async (t) => {

@@ -13,7 +13,10 @@ import {
   type LaunchThreadInput,
   type ServerResponse,
   type SupervisorSnapshot,
+  type ThreadMessageMode,
   type ThreadSnapshot,
+  type TranscriptPage,
+  type UiResponseInput,
 } from "./protocol.ts";
 
 interface PendingRequest {
@@ -108,6 +111,22 @@ export class SupervisorClient {
 
   async delete(id: string, confirmed: boolean): Promise<DeleteThreadResult> {
     return await this.request("delete", { id, confirmed }) as DeleteThreadResult;
+  }
+
+  async sendMessage(id: string, mode: ThreadMessageMode, message: string): Promise<ThreadSnapshot> {
+    return await this.request("message", { id, mode, message }) as ThreadSnapshot;
+  }
+
+  async answer(id: string, response: UiResponseInput): Promise<ThreadSnapshot> {
+    return await this.request("answer", { id, ...response }) as ThreadSnapshot;
+  }
+
+  async abort(id: string): Promise<ThreadSnapshot> {
+    return await this.request("abort", { id }) as ThreadSnapshot;
+  }
+
+  async transcript(id: string, cursor?: string, limit = 100, before?: string): Promise<TranscriptPage> {
+    return await this.request("transcript", { id, cursor, limit, before }) as TranscriptPage;
   }
 
   async shutdownSupervisor(): Promise<void> {

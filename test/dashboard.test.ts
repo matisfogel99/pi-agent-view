@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DashboardController } from "../src/dashboard.ts";
 import type { AgentViewSupervisor } from "../src/index.ts";
-import type { DeleteThreadResult, SupervisorSnapshot, ThreadSnapshot } from "../src/protocol.ts";
+import type { DeleteThreadResult, SupervisorSnapshot, ThreadSnapshot, TranscriptPage } from "../src/protocol.ts";
 
 function thread(overrides: Partial<ThreadSnapshot> & Pick<ThreadSnapshot, "id" | "name" | "project">): ThreadSnapshot {
   return {
@@ -18,7 +18,7 @@ function thread(overrides: Partial<ThreadSnapshot> & Pick<ThreadSnapshot, "id" |
 
 class InMemorySupervisor implements AgentViewSupervisor {
   private listeners = new Set<(snapshot: SupervisorSnapshot) => void>();
-  readonly data: SupervisorSnapshot = { protocolVersion: 2, supervisorPid: 42, threads: [] };
+  readonly data: SupervisorSnapshot = { protocolVersion: 3, supervisorPid: 42, threads: [] };
   async connect() { return this.snapshot(); }
   disconnect() {}
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -30,6 +30,10 @@ class InMemorySupervisor implements AgentViewSupervisor {
   async adopt(): Promise<ThreadSnapshot> { throw new Error("not needed"); }
   async stop(id: string): Promise<ThreadSnapshot> { return this.change(id, "stopped"); }
   async resume(id: string): Promise<ThreadSnapshot> { return this.change(id, "ready"); }
+  async sendMessage(): Promise<ThreadSnapshot> { throw new Error("not needed"); }
+  async answer(): Promise<ThreadSnapshot> { throw new Error("not needed"); }
+  async abort(): Promise<ThreadSnapshot> { throw new Error("not needed"); }
+  async transcript(): Promise<TranscriptPage> { return { entries: [], hasMore: false }; }
   async delete(id: string, confirmed: boolean): Promise<DeleteThreadResult> {
     if (!confirmed) throw new Error("confirmation required");
     const index = this.data.threads.findIndex((candidate) => candidate.id === id);

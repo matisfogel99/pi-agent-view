@@ -29,6 +29,8 @@ Or control it at runtime (including while the foreground agent is working):
 Dashboard controls:
 
 - `↑`/`↓` or `j`/`k`: select a thread
+- `Space`: preview live activity, recent output, failures, or an outstanding extension UI request
+- `Enter`: attach to the selected thread's bounded, live transcript
 - `n`: create and optionally name a persisted RPC thread in the selected project
 - `a`: adopt an existing persisted Pi session (duplicate ownership is rejected)
 - `x` / `R`: stop or resume a thread without deleting its transcript
@@ -37,6 +39,10 @@ Dashboard controls:
 - `g` / `s`: toggle attention grouping or sorting
 - `h`/`l` or `←`/`→`: collapse or expand a project
 - `q` or Escape: close the dashboard
+
+From preview, `r` replies to a ready thread or answers its outstanding select, confirm, input, or editor request. Failed delivery restores the user's text to Pi's editor. `Enter` attaches, and `a` aborts only that worker.
+
+The takeover view reads durable session entries through stable cursors and retains at most 200 entries in client memory. Use `p` for a normal prompt, `s` to steer a running worker, `f` to queue a follow-up, `a` to abort that worker, arrows or `j`/`k` to scroll, `End` to follow the live tail, and `q` or Escape to detach without stopping it.
 
 Grouping, sorting, and project expansion choices remain in place when the dashboard is reopened in the current Pi client.
 
@@ -50,7 +56,7 @@ The supervisor stores its Unix socket, restrictive-permission registry, and work
 ~/.pi/agent/pi-agent-view/
 ```
 
-The supervisor starts automatically when agent mode first needs it. After an unclean supervisor restart, records whose live RPC connection cannot be proven are marked failed rather than incorrectly shown as working; their persisted session path remains available for recovery. Supervisor protocol version 2 adds adoption and lifecycle controls and rejects incompatible clients clearly.
+The supervisor starts automatically when agent mode first needs it. After an unclean supervisor restart, records whose live RPC connection cannot be proven are marked failed rather than incorrectly shown as working; their persisted session path remains available for recovery. Supervisor protocol version 3 adds interactive delivery, outstanding UI requests, and cursor-based transcript retrieval, and rejects incompatible clients clearly.
 
 ## Development
 

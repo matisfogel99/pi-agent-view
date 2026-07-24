@@ -11,7 +11,7 @@ function setup(flag = false) {
   let disconnects = 0;
   let stops = 0;
   let customViews = 0;
-  const snapshot: SupervisorSnapshot = { protocolVersion: 2, supervisorPid: 123, threads: [] };
+  const snapshot: SupervisorSnapshot = { protocolVersion: 3, supervisorPid: 123, threads: [] };
   const client: AgentViewSupervisor = {
     async connect() { connects++; return snapshot; },
     disconnect() { disconnects++; },
@@ -22,6 +22,10 @@ function setup(flag = false) {
     async stop() { stops++; return {} as ThreadSnapshot; },
     async resume() { throw new Error("not used"); },
     async delete() { throw new Error("not used"); },
+    async sendMessage() { throw new Error("not used"); },
+    async answer() { throw new Error("not used"); },
+    async abort() { throw new Error("not used"); },
+    async transcript() { return { entries: [], hasMore: false }; },
   };
   const pi = {
     registerFlag(name: string, options: unknown) { registeredFlag = { name, options }; },
@@ -44,6 +48,10 @@ function setup(flag = false) {
       setStatus: (_key: string, value: unknown) => statuses.push(value),
       custom: async () => { customViews++; return { type: "close" }; },
       input: async () => undefined,
+      editor: async () => undefined,
+      select: async () => undefined,
+      confirm: async () => false,
+      setEditorText: () => undefined,
     },
   };
   return { commands, events, registeredFlag, notifications, statuses, ctx, counts: () => ({ connects, disconnects, stops, customViews }) };

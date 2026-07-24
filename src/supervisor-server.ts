@@ -1,5 +1,6 @@
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
@@ -13,12 +14,17 @@ import {
   type DeleteThreadResult,
   type LaunchThreadInput,
   type ServerResponse,
+  type PendingUiRequest,
   type SupervisorSnapshot,
+  type ThreadMessageMode,
   type ThreadSnapshot,
+  type TranscriptEntry,
+  type TranscriptPage,
+  type UiResponseInput,
 } from "./protocol.ts";
 
 interface RegistryFile {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   threads: ThreadSnapshot[];
 }
 
@@ -47,6 +53,10 @@ export interface SupervisorServerOptions {
 const execFileAsync = promisify(execFile);
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_SEARCH_TEXT = 8_000;
+const MAX_RECENT_OUTPUT = 12_000;
+const MAX_TRANSCRIPT_PAGE = 200;
+const MAX_TRANSCRIPT_ENTRY_BYTES = 64 * 1024;
+const MAX_UI_TEXT = 4_000;
 
 export class SupervisorServer {
   readonly paths: SupervisorPaths;
@@ -149,6 +159,27 @@ export class SupervisorServer {
           data = await this.delete(String(payload?.id ?? ""), payload?.confirmed === true);
           break;
         }
+        case "message": {
+          const payload = request.payload as { id?: unknown; mode?: unknown; message?: unknown } | undefined;
+          data = await this.sendMessage(String(payload?.id ?? ""), payload?.mode, payload?.message);
+          break;
+        }
+        case "answer": {
+          const payload = request.payload as ({ id?: unknown } & Partial<UiResponseInput>) | undefined;
+          data = await this.answer(String(payload?.id ?? ""), payload ?? { requestId: "" });
+          break;
+        }
+        case "abort": data = await this.abort(payloadId(request.payload)); break;
+        case "transcript": {
+          const payload = request.payload as { id?: unknown; cursor?: unknown; limit?: unknown; before?: unknown } | undefined;
+          data = await this.transcript(
+            String(payload?.id ?? ""),
+            typeof payload?.cursor === "string" ? payload.cursor : undefined,
+            Number(payload?.limit),
+            typeof payload?.before === "string" ? payload.before : undefined,
+          );
+          break;
+        }
         case "shutdown":
           data = { shuttingDown: true };
           this.send(socket, { id: request.id, type: "response", success: true, data });
@@ -247,6 +278,7 @@ export class SupervisorServer {
       this.rejectPending(worker, new Error("Worker exited"));
       this.workers.delete(record.id);
       record.pid = undefined;
+      record.pendingRequest = undefined;
       if (worker.stopRequested) this.update(record, "stopped", "worker stopped", "Stopped");
       else this.update(record, "failed", `Worker exited (${signal ?? code ?? "unknown"})${stderr ? `: ${stderr.trim()}` : ""}`, "Worker failed");
     });
@@ -270,6 +302,74 @@ export class SupervisorServer {
       if (!child.killed) child.kill("SIGTERM");
       throw cause;
     }
+  }
+
+  private async sendMessage(id: string, modeValue: unknown, messageValue: unknown): Promise<ThreadSnapshot> {
+    const worker = this.requireWorker(id);
+    const mode = modeValue as ThreadMessageMode;
+    if (mode !== "prompt" && mode !== "steer" && mode !== "followUp") throw new Error("Unknown message delivery mode");
+    if (typeof messageValue !== "string" || !messageValue.trim()) throw new Error("A non-empty message is required");
+    if (mode === "prompt" && worker.record.state !== "ready") throw new Error("Normal prompts require a ready thread");
+    if (mode === "steer" && worker.record.state !== "working") throw new Error("Steering requires a working thread");
+    this.reserveOperation(id, "Another input operation is already in progress for this thread");
+    try {
+      const rpcType = mode === "followUp" ? "follow_up" : mode;
+      await this.rpc(worker, { type: rpcType, message: messageValue.trim() });
+      const activity = mode === "steer" ? "Steering queued" : mode === "followUp" ? "Follow-up queued" : "Prompt accepted";
+      if (mode === "prompt") this.update(worker.record, "working", "prompt accepted", activity);
+      else {
+        worker.record.activity = activity;
+        worker.record.updatedAt = new Date().toISOString();
+        await this.persistAndBroadcast();
+      }
+      return { ...worker.record };
+    } finally {
+      this.lifecycleOperations.delete(id);
+    }
+  }
+
+  private async answer(id: string, input: Partial<UiResponseInput>): Promise<ThreadSnapshot> {
+    const worker = this.requireWorker(id);
+    this.reserveOperation(id, "Another input operation is already in progress for this thread");
+    try {
+      const pending = worker.record.pendingRequest;
+      if (!pending) throw new Error("This thread has no outstanding input request");
+      if (input.requestId !== pending.id) throw new Error("The input request is no longer current; refresh the preview and try again");
+      const response: Record<string, unknown> = { type: "extension_ui_response", id: pending.id };
+      if (input.cancelled) response.cancelled = true;
+      else if (pending.method === "confirm") {
+        if (typeof input.confirmed !== "boolean") throw new Error("A confirmation answer is required");
+        response.confirmed = input.confirmed;
+      } else {
+        if (typeof input.value !== "string") throw new Error("A response value is required");
+        if (pending.method === "select" && !pending.options?.includes(input.value)) throw new Error("The selected choice is not available");
+        response.value = input.value;
+      }
+      await this.writeWorker(worker, response);
+      worker.record.pendingRequest = undefined;
+      this.update(worker.record, "working", "input delivered", "Answer delivered; worker continuing");
+      await this.persist();
+      return { ...worker.record };
+    } finally {
+      this.lifecycleOperations.delete(id);
+    }
+  }
+
+  private async abort(id: string): Promise<ThreadSnapshot> {
+    const worker = this.requireWorker(id);
+    await this.rpc(worker, { type: "abort" });
+    worker.record.activity = "Abort requested";
+    worker.record.updatedAt = new Date().toISOString();
+    await this.persistAndBroadcast();
+    return { ...worker.record };
+  }
+
+  private async transcript(id: string, cursor: string | undefined, requestedLimit: number, before?: string): Promise<TranscriptPage> {
+    const record = this.requireRecord(id);
+    if (!record.sessionFile) throw new Error("This thread has no persisted transcript");
+    if (cursor && before) throw new Error("Transcript requests cannot use both since and before cursors");
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(MAX_TRANSCRIPT_PAGE, Math.floor(requestedLimit))) : 100;
+    return await readTranscriptPage(record.sessionFile, cursor, limit, before);
   }
 
   private async stop(id: string): Promise<ThreadSnapshot> {
@@ -328,6 +428,18 @@ export class SupervisorServer {
     if (owner) throw new Error(`Session is already owned by supervised thread "${owner.name}"`);
   }
 
+  private reserveOperation(id: string, message: string): void {
+    if (this.lifecycleOperations.has(id)) throw new Error(message);
+    this.lifecycleOperations.add(id);
+  }
+
+  private requireWorker(id: string): ManagedWorker {
+    this.requireRecord(id);
+    const worker = this.workers.get(id);
+    if (!worker) throw new Error("The worker is not running; resume it before sending input");
+    return worker;
+  }
+
   private requireRecord(id: string): ThreadSnapshot {
     const record = this.records.get(id);
     if (!record) throw new Error(`Unknown thread: ${id}`);
@@ -353,11 +465,29 @@ export class SupervisorServer {
       worker.record.activity = activity;
       worker.record.transcriptMetadata = appendBounded(worker.record.transcriptMetadata, activity, MAX_SEARCH_TEXT);
     }
-    if (event === "agent_start") this.update(worker.record, "working", event, activity ?? "Agent working");
+    if (event === "agent_start") {
+      worker.record.recentOutput = undefined;
+      this.update(worker.record, "working", event, activity ?? "Agent working");
+    }
     else if (event === "agent_settled") {
+      worker.record.pendingRequest = undefined;
       if (worker.record.state !== "failed" && worker.record.state !== "stopped") this.update(worker.record, "ready", event, worker.record.activity ?? "Ready");
     } else if (event === "extension_ui_request" && expectsUiResponse(value)) {
+      worker.record.pendingRequest = pendingUiRequest(value);
       this.update(worker.record, "needs-input", event, activity ?? "Waiting for input");
+    } else if (isTextDelta(value)) {
+      worker.record.recentOutput = appendBounded(worker.record.recentOutput, value.assistantMessageEvent.delta as string, MAX_RECENT_OUTPUT, "");
+      worker.record.updatedAt = new Date().toISOString();
+      this.broadcast();
+    } else if (event === "message_end" && isObject(value.message) && value.message.role === "assistant") {
+      const finalized = messageText(value.message);
+      if (finalized) worker.record.recentOutput = finalized.slice(-MAX_RECENT_OUTPUT);
+      if (isAgentError(value)) this.update(worker.record, "failed", "agent error", "Agent failed");
+      else {
+        worker.record.updatedAt = new Date().toISOString();
+        void this.persist();
+        this.broadcast();
+      }
     } else if (isAgentError(value)) this.update(worker.record, "failed", "agent error", "Agent failed");
     else {
       worker.record.lastEvent = event;
@@ -384,6 +514,14 @@ export class SupervisorServer {
         }
       });
     });
+  }
+
+  private writeWorker(worker: ManagedWorker, message: Record<string, unknown>): Promise<void> {
+    if (!worker.process.stdin.writable) return Promise.reject(new Error("Worker input is closed; your reply was not delivered"));
+    return new Promise((resolve, reject) => worker.process.stdin.write(encodeJsonLine(message), (error) => {
+      if (error) reject(new Error(`Your reply was not delivered: ${error.message}`));
+      else resolve();
+    }));
   }
 
   private failWorker(worker: ManagedWorker, message: string): void {
@@ -424,7 +562,7 @@ export class SupervisorServer {
   }
 
   private persist(): Promise<void> {
-    const registry: RegistryFile = { version: 2, threads: [...this.records.values()].map((record) => ({ ...record })) };
+    const registry: RegistryFile = { version: 3, threads: [...this.records.values()].map((record) => ({ ...record })) };
     this.persistTail = this.persistTail.catch(() => undefined).then(async () => {
       const temporary = `${this.paths.registryPath}.${process.pid}.tmp`;
       await writeFile(temporary, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
@@ -452,6 +590,7 @@ export class SupervisorServer {
           try { process.kill(record.pid, "SIGTERM"); } catch { /* already exited */ }
         }
         record.pid = undefined;
+        record.pendingRequest = undefined;
         record.state = "failed";
         record.error = "Supervisor restarted; the worker connection was lost and can be resumed from its persisted session";
         record.lastEvent = "reconciled after supervisor restart";
@@ -548,11 +687,93 @@ function compactActivity(text: string): string | undefined {
 }
 
 function expectsUiResponse(value: Record<string, unknown>): boolean {
-  return value.method === "select" || value.method === "confirm" || value.method === "input" || value.method === "editor";
+  return typeof value.id === "string" && (value.method === "select" || value.method === "confirm" || value.method === "input" || value.method === "editor");
 }
 
-function appendBounded(current: string | undefined, next: string, maximum: number): string {
-  return `${current ?? ""} ${next}`.trim().slice(-maximum);
+function pendingUiRequest(value: Record<string, unknown>): PendingUiRequest {
+  return {
+    id: String(value.id),
+    method: value.method as PendingUiRequest["method"],
+    title: typeof value.title === "string" ? value.title.slice(0, MAX_UI_TEXT) : undefined,
+    message: typeof value.message === "string" ? value.message.slice(0, MAX_UI_TEXT) : undefined,
+    options: Array.isArray(value.options) ? value.options.filter((item): item is string => typeof item === "string").slice(0, 100).map((item) => item.slice(0, MAX_UI_TEXT)) : undefined,
+    placeholder: typeof value.placeholder === "string" ? value.placeholder.slice(0, MAX_UI_TEXT) : undefined,
+    prefill: typeof value.prefill === "string" ? value.prefill.slice(0, MAX_RECENT_OUTPUT) : undefined,
+  };
+}
+
+function isTextDelta(value: Record<string, unknown>): value is Record<string, unknown> & { assistantMessageEvent: Record<string, unknown> & { delta: string } } {
+  return value.type === "message_update" && isObject(value.assistantMessageEvent)
+    && value.assistantMessageEvent.type === "text_delta" && typeof value.assistantMessageEvent.delta === "string";
+}
+
+function messageText(message: Record<string, unknown>): string {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content.filter(isObject).map((block) => typeof block.text === "string" ? block.text : "").join("");
+}
+
+function appendBounded(current: string | undefined, next: string, maximum: number, separator = " "): string {
+  const combined = `${current ?? ""}${current ? separator : ""}${next}`;
+  return (separator ? combined.trim() : combined).slice(-maximum);
+}
+
+async function readTranscriptPage(sessionFile: string, cursor: string | undefined, limit: number, before?: string): Promise<TranscriptPage> {
+  const stream = createReadStream(sessionFile);
+  const entries: TranscriptEntry[] = [];
+  let foundCursor = cursor === undefined;
+  let foundBefore = before === undefined;
+  let matchingEntries = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    const dispose = readJsonLines(stream, (value) => {
+      if (!isObject(value) || value.type === "session" || typeof value.id !== "string") return;
+      const entry = boundedTranscriptEntry(value);
+      if (before !== undefined) {
+        if (entry.id === before) { foundBefore = true; return; }
+        if (foundBefore) return;
+        matchingEntries++;
+        entries.push(entry);
+        if (entries.length > limit) entries.shift();
+        return;
+      }
+      if (cursor === undefined) {
+        matchingEntries++;
+        entries.push(entry);
+        if (entries.length > limit) entries.shift();
+        return;
+      }
+      if (!foundCursor) {
+        if (entry.id === cursor) foundCursor = true;
+        return;
+      }
+      if (entries.length <= limit) entries.push(entry);
+    }, (error) => {
+      dispose();
+      stream.destroy();
+      reject(new Error(`Cannot read thread transcript: ${error.message}`));
+    });
+    stream.once("error", reject);
+    stream.once("end", () => { dispose(); resolve(); });
+  });
+
+  if (!foundCursor || !foundBefore) throw new Error("Transcript cursor is no longer available");
+  const hasMore = cursor === undefined || before !== undefined ? matchingEntries > limit : entries.length > limit;
+  if (entries.length > limit) entries.length = limit;
+  return { entries, startCursor: entries[0]?.id, cursor: entries.at(-1)?.id ?? cursor, hasMore };
+}
+
+function boundedTranscriptEntry(value: Record<string, unknown>): TranscriptEntry {
+  const entry = value as TranscriptEntry;
+  const serialized = JSON.stringify(entry);
+  if (Buffer.byteLength(serialized) <= MAX_TRANSCRIPT_ENTRY_BYTES) return entry;
+  return {
+    id: entry.id,
+    type: "truncated",
+    timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+    originalType: entry.type,
+    message: `Entry omitted from takeover rendering because it exceeds ${MAX_TRANSCRIPT_ENTRY_BYTES} bytes; it remains intact in the Pi session file.`,
+  };
 }
 
 function firstUsefulLine(text: string): string | undefined {
