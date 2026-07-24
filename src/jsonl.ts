@@ -1,10 +1,22 @@
 import { StringDecoder } from "node:string_decoder";
 import type { Readable } from "node:stream";
 
+export interface JsonLineReaderOptions {
+  /** Bounds memory even when a hostile peer never sends LF. */
+  maximumLineLength?: number;
+}
+
 /** Pi RPC uses LF-only JSONL framing; readline is intentionally not used. */
-export function readJsonLines(stream: Readable, onValue: (value: unknown) => void, onError: (error: Error) => void): () => void {
+export function readJsonLines(
+  stream: Readable,
+  onValue: (value: unknown) => void,
+  onError: (error: Error) => void,
+  options: JsonLineReaderOptions = {},
+): () => void {
   const decoder = new StringDecoder("utf8");
+  const maximumLineLength = Math.max(1, options.maximumLineLength ?? 1024 * 1024);
   let buffer = "";
+  let discardingOversizedLine = false;
 
   const consume = (final = false) => {
     while (true) {
@@ -12,10 +24,23 @@ export function readJsonLines(stream: Readable, onValue: (value: unknown) => voi
       if (newline < 0) break;
       let line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
+      if (discardingOversizedLine) {
+        discardingOversizedLine = false;
+        continue;
+      }
+      if (line.length > maximumLineLength) {
+        onError(new Error(`JSONL record exceeds ${maximumLineLength} characters`));
+        continue;
+      }
       if (line.endsWith("\r")) line = line.slice(0, -1);
       parse(line);
     }
-    if (final && buffer.length > 0) {
+    if (buffer.length > maximumLineLength && !discardingOversizedLine) {
+      discardingOversizedLine = true;
+      buffer = "";
+      onError(new Error(`JSONL record exceeds ${maximumLineLength} characters`));
+    }
+    if (final && buffer.length > 0 && !discardingOversizedLine) {
       const line = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
       buffer = "";
       parse(line);

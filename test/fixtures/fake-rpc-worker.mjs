@@ -6,6 +6,7 @@ const args = process.argv.slice(2);
 const existingSession = valueAfter("--session");
 const sessionDir = valueAfter("--session-dir") ?? process.cwd();
 const name = valueAfter("--name") ?? "fake";
+if (process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG) appendFileSync(process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG, `${JSON.stringify(args)}\n`);
 mkdirSync(sessionDir, { recursive: true });
 const sessionFile = existingSession ?? join(sessionDir, "fake-session.jsonl");
 if (!existingSession) writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), name })}\n`, { mode: 0o600 });
@@ -31,6 +32,10 @@ function handle(command) {
     return;
   }
   if (command.type === "prompt") {
+    if (command.message === "delayed") {
+      setTimeout(() => respond(command), 250);
+      return;
+    }
     respond(command);
     appendMessage("user", command.message);
     runPrompt(command.message);
@@ -72,6 +77,20 @@ function runPrompt(message) {
       send({ type: "agent_settled" });
     } else if (message === "crash") {
       process.exit(17);
+    } else if (message === "malformed") {
+      process.stdout.write("{not-json}\n");
+    } else if (message === "partial") {
+      const event = `${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial result" }], stopReason: "stop" } })}\n`;
+      process.stdout.write(event.slice(0, 17));
+      setTimeout(() => {
+        process.stdout.write(event.slice(17));
+        send({ type: "agent_settled" });
+      }, 20);
+    } else if (message === "oversized") {
+      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x".repeat(300_000) } });
+    } else if (message === "bounded") {
+      for (let index = 0; index < 3; index++) send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: String(index).repeat(100_000) } });
+      send({ type: "agent_settled" });
     } else {
       setTimeout(() => {
         appendMessage("assistant", "deterministic result");

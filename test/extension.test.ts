@@ -11,7 +11,7 @@ function setup(flag = false) {
   let disconnects = 0;
   let stops = 0;
   let customViews = 0;
-  const snapshot: SupervisorSnapshot = { protocolVersion: 3, supervisorPid: 123, threads: [] };
+  const snapshot: SupervisorSnapshot = { protocolVersion: 4, supervisorPid: 123, threads: [] };
   const client: AgentViewSupervisor = {
     async connect() { connects++; return snapshot; },
     disconnect() { disconnects++; },

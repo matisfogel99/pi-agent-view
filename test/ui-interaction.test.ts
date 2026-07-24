@@ -7,18 +7,20 @@ import type { SupervisorSnapshot, ThreadMessageMode, ThreadSnapshot } from "../s
 const baseThread: ThreadSnapshot = {
   id: "thread-1", cwd: "/project", project: "/project", name: "Interactive thread", state: "ready",
   sessionOrigin: "created", sessionFile: "/tmp/session.jsonl",
+  checkout: { mode: "directory", path: "/project", managed: false }, projectTrusted: false,
   createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", recentOutput: "recent result",
 };
 
 test("Space preview, input focus handoff, takeover controls, live rendering, and detach work without touching foreground Pi", async () => {
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  const events = new Map<string, (event: unknown, ctx: any) => Promise<void>>();
   const listeners = new Set<(snapshot: SupervisorSnapshot) => void>();
   let thread = structuredClone(baseThread);
   const deliveries: ThreadMessageMode[] = [];
   const notifications: string[] = [];
   let restoredInput: string | undefined;
   let aborts = 0;
-  const snapshot = (): SupervisorSnapshot => ({ protocolVersion: 3, supervisorPid: 1, threads: [structuredClone(thread)] });
+  const snapshot = (): SupervisorSnapshot => ({ protocolVersion: 4, supervisorPid: 1, threads: [structuredClone(thread)] });
   const emit = () => { for (const listener of listeners) listener(snapshot()); };
   const supervisor: AgentViewSupervisor = {
     async connect() { return snapshot(); }, disconnect() {},
@@ -43,7 +45,7 @@ test("Space preview, input focus handoff, takeover controls, live rendering, and
   const pi = {
     registerFlag() {}, getFlag() { return true; },
     registerCommand(name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) { commands.set(name, command); },
-    on() {},
+    on(name: string, handler: (event: unknown, ctx: any) => Promise<void>) { events.set(name, handler); },
   };
   createAgentViewExtension(() => supervisor)(pi as any);
 
@@ -73,6 +75,7 @@ test("Space preview, input focus handoff, takeover controls, live rendering, and
     },
   };
 
+  await events.get("session_start")!({}, ctx);
   await commands.get("threads")!.handler("", ctx);
   assert.deepEqual(deliveries, ["prompt", "steer", "followUp"]);
   assert.equal(aborts, 1, "takeover abort targets only the selected worker");

@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export type ThreadState = "starting" | "working" | "needs-input" | "ready" | "failed" | "stopped";
 export type SessionOrigin = "created" | "adopted";
@@ -15,6 +15,19 @@ export interface PendingUiRequest {
   prefill?: string;
 }
 
+export type CheckoutMode = "worktree" | "shared" | "directory";
+
+export interface ThreadCheckout {
+  mode: CheckoutMode;
+  /** Actual checkout root. Worker cwd may be a subdirectory of this path. */
+  path: string;
+  repositoryRoot?: string;
+  branch?: string;
+  baseCommit?: string;
+  managed: boolean;
+  warning?: string;
+}
+
 export interface ThreadSnapshot {
   id: string;
   cwd: string;
@@ -25,6 +38,9 @@ export interface ThreadSnapshot {
   sessionFile?: string;
   sessionId?: string;
   sessionOrigin: SessionOrigin;
+  checkout: ThreadCheckout;
+  /** Whether this worker was explicitly approved to load project-local Pi resources. */
+  projectTrusted: boolean;
   createdAt: string;
   updatedAt: string;
   lastEvent?: string;
@@ -47,11 +63,19 @@ export interface LaunchThreadInput {
   cwd: string;
   name?: string;
   prompt?: string;
+  /** Git checkouts are isolated unless the user explicitly chooses shared. */
+  isolation?: "required" | "shared";
+  /** Scoped to this worker process; false is the safe default. */
+  projectTrusted?: boolean;
 }
 
 export interface AdoptThreadInput {
   sessionFile: string;
   name?: string;
+  /** Required for Git sessions because their persisted cwd cannot be transparently moved. */
+  allowSharedCheckout?: boolean;
+  /** Scoped to this worker process; false is the safe default. */
+  projectTrusted?: boolean;
 }
 
 export type ThreadMessageMode = "prompt" | "steer" | "followUp";
@@ -82,6 +106,7 @@ export interface DeleteThreadResult {
   id: string;
   recordRemoved: boolean;
   transcriptDeleted: boolean;
+  checkoutRemoved: boolean;
   preservedPaths: string[];
   warnings: string[];
 }

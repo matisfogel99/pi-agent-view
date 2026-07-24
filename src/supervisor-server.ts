@@ -1,9 +1,9 @@
 import { spawn, execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { encodeJsonLine, readJsonLines } from "./jsonl.ts";
 import { getSupervisorPaths, type SupervisorPaths } from "./paths.ts";
@@ -13,6 +13,7 @@ import {
   type ClientRequest,
   type DeleteThreadResult,
   type LaunchThreadInput,
+  type ThreadCheckout,
   type ServerResponse,
   type PendingUiRequest,
   type SupervisorSnapshot,
@@ -24,7 +25,7 @@ import {
 } from "./protocol.ts";
 
 interface RegistryFile {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   threads: ThreadSnapshot[];
 }
 
@@ -34,6 +35,11 @@ interface ManagedWorker {
   stopRequested: boolean;
   rpcSequence: number;
   pending: Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>;
+}
+
+interface ClientOutputState {
+  blocked: boolean;
+  pendingSnapshot?: string;
 }
 
 interface SessionMetadata {
@@ -48,6 +54,7 @@ export interface SupervisorServerOptions {
   paths?: SupervisorPaths;
   workerCommand?: string;
   workerArgs?: string[];
+  workerRpcTimeoutMs?: number;
 }
 
 const execFileAsync = promisify(execFile);
@@ -57,51 +64,96 @@ const MAX_RECENT_OUTPUT = 12_000;
 const MAX_TRANSCRIPT_PAGE = 200;
 const MAX_TRANSCRIPT_ENTRY_BYTES = 64 * 1024;
 const MAX_UI_TEXT = 4_000;
+const MAX_WORKER_JSONL = 256 * 1024;
+const MAX_CLIENT_JSONL = 1024 * 1024;
+const MAX_CLIENT_REQUEST_HISTORY = 256;
+const MAX_CLIENT_INFLIGHT = 64;
+const DEFAULT_WORKER_RPC_TIMEOUT_MS = 10_000;
 
 export class SupervisorServer {
   readonly paths: SupervisorPaths;
   private readonly workerCommand: string;
   private readonly workerArgs: string[];
+  private readonly workerRpcTimeoutMs: number;
   private readonly records = new Map<string, ThreadSnapshot>();
   private readonly workers = new Map<string, ManagedWorker>();
   private readonly clients = new Set<Socket>();
   private readonly lifecycleOperations = new Set<string>();
+  private readonly requestOperations = new Set<Promise<void>>();
+  private readonly clientRequests = new WeakMap<Socket, Map<string, "pending" | ServerResponse>>();
+  private readonly clientOutput = new WeakMap<Socket, ClientOutputState>();
   private server?: Server;
+  private lockHandle?: FileHandle;
   private persistTail: Promise<void> = Promise.resolve();
+  private closePromise?: Promise<void>;
 
   constructor(options: SupervisorServerOptions = {}) {
     this.paths = options.paths ?? getSupervisorPaths();
     this.workerCommand = options.workerCommand ?? process.env.PI_AGENT_VIEW_WORKER_COMMAND ?? "pi";
     this.workerArgs = options.workerArgs ?? parseWorkerArgs(process.env.PI_AGENT_VIEW_WORKER_ARGS);
+    this.workerRpcTimeoutMs = options.workerRpcTimeoutMs ?? parsePositiveInteger(process.env.PI_AGENT_VIEW_RPC_TIMEOUT_MS) ?? DEFAULT_WORKER_RPC_TIMEOUT_MS;
   }
 
   async start(): Promise<void> {
-    await mkdir(this.paths.sessionsDir, { recursive: true, mode: 0o700 });
-    await chmod(this.paths.stateDir, 0o700);
-    await this.loadAndReconcile();
-    await removeStaleSocket(this.paths.socketPath);
+    await secureDirectory(this.paths.stateDir);
+    await secureDirectory(this.paths.sessionsDir);
+    await secureDirectory(this.paths.worktreesDir);
+    this.lockHandle = await acquireSupervisorLock(this.paths.lockPath);
+    try {
+      await this.loadAndReconcile();
+      await removeStaleSocket(this.paths.socketPath);
 
-    this.server = createServer((socket) => this.accept(socket));
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error) => reject(error);
-      this.server!.once("error", onError);
-      this.server!.listen(this.paths.socketPath, () => {
-        this.server!.off("error", onError);
-        resolve();
+      this.server = createServer((socket) => this.accept(socket));
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => reject(error);
+        this.server!.once("error", onError);
+        this.server!.listen(this.paths.socketPath, () => {
+          this.server!.off("error", onError);
+          resolve();
+        });
       });
-    });
-    await chmod(this.paths.socketPath, 0o600);
+      await chmod(this.paths.socketPath, 0o600);
+    } catch (cause) {
+      await this.releaseLock();
+      throw cause;
+    }
   }
 
   async close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    await this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     for (const client of this.clients) client.destroy();
     this.clients.clear();
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = undefined;
     }
+    await Promise.allSettled([...this.requestOperations]);
+    const workers = [...this.workers.values()];
+    await Promise.all(workers.map(async (worker) => {
+      if (!worker.stopRequested) {
+        worker.record.state = "failed";
+        worker.record.error = "Supervisor shut down; resume the persisted session to continue";
+        worker.record.lastEvent = "worker terminated during supervisor shutdown";
+        worker.record.activity = "Supervisor stopped worker; resume available";
+        worker.record.updatedAt = new Date().toISOString();
+      }
+      await terminateWorker(worker.process);
+    }));
+    await this.persist();
     await rm(this.paths.socketPath, { force: true });
     await this.persistTail;
+    await this.releaseLock();
+  }
+
+  private async releaseLock(): Promise<void> {
+    if (!this.lockHandle) return;
+    await this.lockHandle.close().catch(() => undefined);
+    this.lockHandle = undefined;
+    await rm(this.paths.lockPath, { force: true }).catch(() => undefined);
   }
 
   snapshot(): SupervisorSnapshot {
@@ -115,6 +167,9 @@ export class SupervisorServer {
   private accept(socket: Socket): void {
     socket.setEncoding("utf8");
     let authenticated = false;
+    const requestHistory = new Map<string, "pending" | ServerResponse>();
+    this.clientRequests.set(socket, requestHistory);
+    this.clientOutput.set(socket, { blocked: false });
     const disposeReader = readJsonLines(socket, (value) => {
       if (!isObject(value)) return this.send(socket, { id: "unknown", type: "response", success: false, error: "Request must be an object" });
       if (!authenticated) {
@@ -133,8 +188,19 @@ export class SupervisorServer {
         this.send(socket, { id, type: "response", success: true, data: this.snapshot() });
         return;
       }
-      void this.handleRequest(socket, value as unknown as ClientRequest);
-    }, (error) => this.send(socket, { id: "parse", type: "response", success: false, error: error.message }));
+      const id = typeof value.id === "string" ? value.id : "";
+      if (!id) return this.send(socket, { id: "unknown", type: "response", success: false, error: "Requests require a string id" });
+      const previous = requestHistory.get(id);
+      if (previous === "pending") return; // The original request will produce the one correlated response.
+      if (previous) return this.send(socket, previous, false);
+      if ([...requestHistory.values()].filter((entry) => entry === "pending").length >= MAX_CLIENT_INFLIGHT) {
+        return this.send(socket, { id, type: "response", success: false, error: "Too many client requests are in progress" }, false);
+      }
+      requestHistory.set(id, "pending");
+      const operation = this.handleRequest(socket, value as unknown as ClientRequest);
+      this.requestOperations.add(operation);
+      void operation.finally(() => this.requestOperations.delete(operation));
+    }, (error) => this.send(socket, { id: "parse", type: "response", success: false, error: error.message }), { maximumLineLength: MAX_CLIENT_JSONL });
 
     this.clients.add(socket);
     socket.once("close", () => {
@@ -195,17 +261,19 @@ export class SupervisorServer {
 
   private async launch(input: LaunchThreadInput): Promise<ThreadSnapshot> {
     if (!input || typeof input.cwd !== "string" || input.cwd.trim() === "") throw new Error("A working directory is required");
-    const cwd = await realpath(input.cwd);
-    if (!(await stat(cwd)).isDirectory()) throw new Error("The working directory is not a directory");
-    const project = await canonicalProject(cwd);
+    const selectedCwd = await realpath(input.cwd);
+    if (!(await stat(selectedCwd)).isDirectory()) throw new Error("The working directory is not a directory");
+    if (input.isolation !== undefined && input.isolation !== "required" && input.isolation !== "shared") throw new Error("Unknown isolation policy");
     const id = randomUUID();
+    const prepared = await prepareCheckout(selectedCwd, id, this.paths.worktreesDir, input.isolation ?? "required");
     const now = new Date().toISOString();
-    const name = input.name?.trim() || firstUsefulLine(input.prompt ?? "") || `${basename(project) || "Project"} thread ${this.records.size + 1}`;
+    const name = input.name?.trim() || firstUsefulLine(input.prompt ?? "") || `${basename(prepared.project) || "Project"} thread ${this.records.size + 1}`;
     const sessionDir = join(this.paths.sessionsDir, id);
-    await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+    await secureDirectory(sessionDir);
 
     const record: ThreadSnapshot = {
-      id, cwd, project, name, state: "starting", sessionOrigin: "created",
+      id, cwd: prepared.cwd, project: prepared.project, name, state: "starting", sessionOrigin: "created",
+      checkout: prepared.checkout, projectTrusted: input.projectTrusted === true,
       createdAt: now, updatedAt: now, lastEvent: "worker spawning", activity: "Starting worker",
     };
     this.records.set(id, record);
@@ -218,11 +286,19 @@ export class SupervisorServer {
     const metadata = await readSessionMetadata(input.sessionFile);
     this.assertSessionAvailable(metadata.file);
     const project = await canonicalProject(metadata.cwd);
+    const repositoryRoot = await gitRoot(metadata.cwd);
+    if (repositoryRoot && input.allowSharedCheckout !== true) {
+      throw new Error("Adopted Git sessions resume in their persisted checkout; explicit shared-checkout approval is required");
+    }
     const now = new Date().toISOString();
     const record: ThreadSnapshot = {
       id: randomUUID(), cwd: metadata.cwd, project,
       name: input.name?.trim() || metadata.name || firstUsefulLine(metadata.searchText) || basename(metadata.cwd) || "Adopted thread",
       state: "starting", sessionFile: metadata.file, sessionId: metadata.id, sessionOrigin: "adopted",
+      checkout: repositoryRoot
+        ? { mode: "shared", path: repositoryRoot, repositoryRoot, managed: false, warning: "Adopted session uses its existing shared checkout" }
+        : { mode: "directory", path: metadata.cwd, managed: false },
+      projectTrusted: input.projectTrusted === true,
       createdAt: now, updatedAt: now, lastEvent: "adopting persisted session", activity: "Starting adopted session",
       transcriptMetadata: metadata.searchText,
     };
@@ -244,6 +320,11 @@ export class SupervisorServer {
       const metadata = await readSessionMetadata(record.sessionFile);
       if (this.workers.has(id)) throw new Error("The thread was resumed by another request");
       this.assertSessionAvailable(metadata.file, id);
+      try {
+        if (!(await stat(record.cwd)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        throw new Error(`The worker checkout no longer exists: ${record.cwd}`);
+      }
       record.sessionFile = metadata.file;
       record.error = undefined;
       return await this.startWorker(record, ["--session", metadata.file]);
@@ -259,8 +340,14 @@ export class SupervisorServer {
     record.lastEvent = "worker spawning";
     record.activity = "Starting worker";
     record.error = undefined;
-    const args = [...this.workerArgs, "--mode", "rpc", ...sessionArgs, "--name", record.name];
-    const child = spawn(this.workerCommand, args, { cwd: record.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const trustArg = record.projectTrusted ? "--approve" : "--no-approve";
+    const args = [...this.workerArgs, "--mode", "rpc", trustArg, ...sessionArgs, "--name", record.name];
+    const child = spawn(this.workerCommand, args, {
+      cwd: record.cwd,
+      env: process.env,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
     const worker: ManagedWorker = { record, process: child, stopRequested: false, rpcSequence: 0, pending: new Map() };
     this.workers.set(record.id, worker);
     record.pid = child.pid;
@@ -269,7 +356,10 @@ export class SupervisorServer {
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
-    readJsonLines(child.stdout, (value) => this.onWorkerMessage(worker, value), (error) => this.failWorker(worker, error.message));
+    readJsonLines(child.stdout, (value) => this.onWorkerMessage(worker, value), (error) => {
+      this.failWorker(worker, error.message);
+      void terminateWorker(child);
+    }, { maximumLineLength: MAX_WORKER_JSONL });
     child.once("error", (error) => {
       this.rejectPending(worker, error);
       this.failWorker(worker, `Could not start worker: ${error.message}`);
@@ -280,7 +370,11 @@ export class SupervisorServer {
       record.pid = undefined;
       record.pendingRequest = undefined;
       if (worker.stopRequested) this.update(record, "stopped", "worker stopped", "Stopped");
-      else this.update(record, "failed", `Worker exited (${signal ?? code ?? "unknown"})${stderr ? `: ${stderr.trim()}` : ""}`, "Worker failed");
+      else if (record.state === "failed") {
+        record.updatedAt = new Date().toISOString();
+        void this.persist();
+        this.broadcast();
+      } else this.update(record, "failed", `Worker exited (${signal ?? code ?? "unknown"})${stderr ? `: ${stderr.trim()}` : ""}`, "Worker failed");
     });
 
     try {
@@ -374,15 +468,21 @@ export class SupervisorServer {
 
   private async stop(id: string): Promise<ThreadSnapshot> {
     const record = this.requireRecord(id);
+    if (this.lifecycleOperations.has(id)) throw new Error("Another lifecycle operation is already in progress for this thread");
     const worker = this.workers.get(id);
     if (!worker) {
       this.update(record, "stopped", "worker already stopped", "Stopped");
       return { ...record };
     }
-    worker.stopRequested = true;
-    worker.process.kill("SIGTERM");
-    this.update(record, "stopped", "stop requested", "Stopping worker");
-    return { ...record };
+    this.lifecycleOperations.add(id);
+    try {
+      worker.stopRequested = true;
+      this.update(record, "stopped", "stop requested", "Stopping worker");
+      await terminateWorker(worker.process);
+      return { ...record };
+    } finally {
+      this.lifecycleOperations.delete(id);
+    }
   }
 
   private async delete(id: string, confirmed: boolean): Promise<DeleteThreadResult> {
@@ -392,35 +492,74 @@ export class SupervisorServer {
     if (this.workers.has(id)) throw new Error("Wait for the stopped worker process to exit before deleting it");
     if (this.lifecycleOperations.has(id)) throw new Error("Another lifecycle operation is already in progress for this thread");
     this.lifecycleOperations.add(id);
-
-    const result: DeleteThreadResult = { id, recordRemoved: false, transcriptDeleted: false, preservedPaths: [], warnings: [] };
-    if (record.sessionOrigin === "adopted") {
-      if (record.sessionFile) result.preservedPaths.push(record.sessionFile);
-      result.warnings.push("The adopted Pi session was preserved");
-    } else {
-      const sessionDir = join(this.paths.sessionsDir, id);
-      const safe = record.sessionFile && isPathInside(sessionDir, record.sessionFile);
-      if (!safe) {
+    try {
+      const result: DeleteThreadResult = { id, recordRemoved: false, transcriptDeleted: false, checkoutRemoved: false, preservedPaths: [], warnings: [] };
+      await this.cleanupCheckout(record, result);
+      if (record.sessionOrigin === "adopted") {
         if (record.sessionFile) result.preservedPaths.push(record.sessionFile);
-        result.warnings.push("The transcript path was outside the managed session directory and was preserved");
+        result.warnings.push("The adopted Pi session was preserved");
       } else {
-        try {
-          await rm(sessionDir, { recursive: true, force: true });
-          result.transcriptDeleted = true;
-        } catch (cause) {
-          result.preservedPaths.push(sessionDir);
-          result.warnings.push(`Could not remove managed transcript data: ${errorMessage(cause)}`);
+        const sessionDir = join(this.paths.sessionsDir, id);
+        const safe = record.sessionFile && isPathInside(sessionDir, record.sessionFile);
+        if (!safe) {
+          if (record.sessionFile) result.preservedPaths.push(record.sessionFile);
+          result.warnings.push("The transcript path was outside the managed session directory and was preserved");
+        } else {
+          try {
+            await rm(sessionDir, { recursive: true, force: true });
+            result.transcriptDeleted = true;
+          } catch (cause) {
+            result.preservedPaths.push(sessionDir);
+            result.warnings.push(`Could not remove managed transcript data: ${errorMessage(cause)}`);
+          }
         }
       }
-    }
-    this.records.delete(id);
-    result.recordRemoved = true;
-    try {
+      this.records.delete(id);
+      result.recordRemoved = true;
       await this.persistAndBroadcast();
       return result;
     } finally {
       this.lifecycleOperations.delete(id);
     }
+  }
+
+  private async cleanupCheckout(record: ThreadSnapshot, result: DeleteThreadResult): Promise<void> {
+    const checkout = record.checkout;
+    if (checkout.mode !== "worktree" || !checkout.managed || !checkout.repositoryRoot) {
+      if (checkout.mode === "shared") result.warnings.push("The shared checkout was not removed");
+      return;
+    }
+    let exists = true;
+    try { await lstat(checkout.path); } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") exists = false;
+      else throw cause;
+    }
+    if (!exists) {
+      await git(checkout.repositoryRoot, ["worktree", "prune"]).catch(() => undefined);
+      result.warnings.push(`Managed worktree was already removed externally: ${checkout.path}`);
+      if (checkout.branch) result.warnings.push(`Preserved Git branch: ${checkout.branch}`);
+      return;
+    }
+    const status = await git(checkout.path, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (status.stdout.trim()) {
+      result.preservedPaths.push(checkout.path);
+      result.warnings.push("Managed worktree has uncommitted changes and was preserved");
+      return;
+    }
+    if (checkout.baseCommit) {
+      const head = (await git(checkout.path, ["rev-parse", "HEAD"])).stdout.trim();
+      if (head !== checkout.baseCommit) {
+        const count = Number((await git(checkout.path, ["rev-list", "--count", `${checkout.baseCommit}..HEAD`])).stdout.trim());
+        result.preservedPaths.push(checkout.path);
+        result.warnings.push(Number.isFinite(count) && count > 0
+          ? `Managed worktree contains ${count} commit(s) created after launch that may be unpushed and was preserved`
+          : "Managed worktree history diverged from its launch commit and was preserved");
+        return;
+      }
+    }
+    await git(checkout.repositoryRoot, ["worktree", "remove", checkout.path]);
+    if (checkout.branch) await git(checkout.repositoryRoot, ["branch", "-D", checkout.branch]);
+    result.checkoutRemoved = true;
   }
 
   private assertSessionAvailable(sessionFile: string, ownerId?: string): void {
@@ -504,7 +643,7 @@ export class SupervisorServer {
       const timer = setTimeout(() => {
         worker.pending.delete(id);
         reject(new Error(`Worker RPC timed out: ${String(command.type)}`));
-      }, 10_000);
+      }, this.workerRpcTimeoutMs);
       worker.pending.set(id, { resolve, reject, timer });
       worker.process.stdin.write(encodeJsonLine({ ...command, id }), (error) => {
         if (error) {
@@ -549,10 +688,39 @@ export class SupervisorServer {
 
   private broadcast(): void {
     const message = encodeJsonLine({ type: "snapshot", data: this.snapshot() });
-    for (const client of this.clients) if (client.writable) client.write(message);
+    for (const client of this.clients) this.writeSnapshot(client, message);
   }
 
-  private send(socket: Socket, response: ServerResponse): void {
+  private writeSnapshot(socket: Socket, message: string): void {
+    if (!socket.writable) return;
+    const output = this.clientOutput.get(socket);
+    if (!output) return;
+    if (output.blocked) {
+      output.pendingSnapshot = message; // Coalesce live updates for slow clients.
+      return;
+    }
+    if (socket.write(message)) return;
+    output.blocked = true;
+    socket.once("drain", () => {
+      output.blocked = false;
+      const pending = output.pendingSnapshot;
+      output.pendingSnapshot = undefined;
+      if (pending) this.writeSnapshot(socket, pending);
+    });
+  }
+
+  private send(socket: Socket, response: ServerResponse, remember = true): void {
+    if (remember) {
+      const history = this.clientRequests.get(socket);
+      if (history?.has(response.id)) {
+        history.set(response.id, response);
+        while (history.size > MAX_CLIENT_REQUEST_HISTORY) {
+          const completed = [...history.entries()].find(([, value]) => value !== "pending");
+          if (!completed) break;
+          history.delete(completed[0]);
+        }
+      }
+    }
     if (socket.writable) socket.write(encodeJsonLine(response));
   }
 
@@ -562,7 +730,7 @@ export class SupervisorServer {
   }
 
   private persist(): Promise<void> {
-    const registry: RegistryFile = { version: 3, threads: [...this.records.values()].map((record) => ({ ...record })) };
+    const registry: RegistryFile = { version: 4, threads: [...this.records.values()].map((record) => ({ ...record })) };
     this.persistTail = this.persistTail.catch(() => undefined).then(async () => {
       const temporary = `${this.paths.registryPath}.${process.pid}.tmp`;
       await writeFile(temporary, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
@@ -575,7 +743,9 @@ export class SupervisorServer {
   private async loadAndReconcile(): Promise<void> {
     let registry: RegistryFile | undefined;
     try {
+      await assertUserOwnedFile(this.paths.registryPath);
       registry = JSON.parse(await readFile(this.paths.registryPath, "utf8")) as RegistryFile;
+      if (!registry || !Array.isArray(registry.threads)) throw new Error("Registry does not contain a thread list");
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot read supervisor registry: ${errorMessage(cause)}`);
     }
@@ -584,11 +754,11 @@ export class SupervisorServer {
         ...saved,
         project: saved.project || saved.cwd,
         sessionOrigin: saved.sessionOrigin || "created",
+        checkout: saved.checkout ?? { mode: "shared", path: saved.cwd, repositoryRoot: saved.project, managed: false, warning: "Legacy thread uses its existing checkout" },
+        projectTrusted: saved.projectTrusted === true,
       };
       if (record.state === "starting" || record.state === "working" || record.state === "needs-input" || record.state === "ready") {
-        if (record.pid && isProcessAlive(record.pid)) {
-          try { process.kill(record.pid, "SIGTERM"); } catch { /* already exited */ }
-        }
+        if (record.pid && isProcessAlive(record.pid)) await terminatePid(record.pid);
         record.pid = undefined;
         record.pendingRequest = undefined;
         record.state = "failed";
@@ -604,12 +774,73 @@ export class SupervisorServer {
 }
 
 async function canonicalProject(cwd: string): Promise<string> {
+  return await gitRoot(cwd) ?? cwd;
+}
+
+async function gitRoot(cwd: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 2_000 });
+    const { stdout } = await git(cwd, ["rev-parse", "--show-toplevel"]);
     const root = stdout.trim();
-    if (root) return await realpath(root);
-  } catch { /* Non-Git projects are identified by canonical cwd. */ }
-  return cwd;
+    return root ? await realpath(root) : undefined;
+  } catch { return undefined; }
+}
+
+async function prepareCheckout(
+  selectedCwd: string,
+  id: string,
+  worktreesDir: string,
+  isolation: "required" | "shared",
+): Promise<{ cwd: string; project: string; checkout: ThreadCheckout }> {
+  const repositoryRoot = await gitRoot(selectedCwd);
+  if (!repositoryRoot) return {
+    cwd: selectedCwd,
+    project: selectedCwd,
+    checkout: { mode: "directory", path: selectedCwd, managed: false },
+  };
+  if (isolation === "shared") return {
+    cwd: selectedCwd,
+    project: repositoryRoot,
+    checkout: {
+      mode: "shared", path: repositoryRoot, repositoryRoot, managed: false,
+      warning: "Isolation was explicitly disabled; concurrent workers may modify the same checkout",
+    },
+  };
+
+  const checkoutPath = join(worktreesDir, id);
+  const branch = `pi-agent-view/${id}`;
+  const baseCommit = (await git(repositoryRoot, ["rev-parse", "HEAD"])).stdout.trim();
+  if (!baseCommit) throw new Error("Cannot isolate this Git repository because HEAD does not name a commit");
+  const subdirectory = relative(repositoryRoot, selectedCwd);
+  try {
+    await git(repositoryRoot, ["worktree", "add", "-b", branch, checkoutPath, baseCommit], 15_000);
+  } catch (cause) {
+    throw new Error(`Required Git worktree isolation failed; no worker was started. Choose shared checkout explicitly only if concurrent edits are safe: ${errorMessage(cause)}`);
+  }
+  const workerCwd = resolve(checkoutPath, subdirectory);
+  if (!isPathInside(checkoutPath, workerCwd)) {
+    await removeUnusedCheckout({ mode: "worktree", path: checkoutPath, repositoryRoot, branch, baseCommit, managed: true });
+    throw new Error("Selected working directory is outside the Git repository");
+  }
+  return {
+    cwd: workerCwd,
+    project: repositoryRoot,
+    checkout: { mode: "worktree", path: checkoutPath, repositoryRoot, branch, baseCommit, managed: true },
+  };
+}
+
+async function removeUnusedCheckout(checkout: ThreadCheckout): Promise<void> {
+  if (!checkout.repositoryRoot) return;
+  await git(checkout.repositoryRoot, ["worktree", "remove", "--force", checkout.path]).catch(() => undefined);
+  if (checkout.branch) await git(checkout.repositoryRoot, ["branch", "-D", checkout.branch]).catch(() => undefined);
+}
+
+async function git(cwd: string, args: string[], timeout = 5_000): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await execFileAsync("git", ["-C", cwd, ...args], { timeout, maxBuffer: 1024 * 1024 });
+  } catch (cause) {
+    const detail = cause as Error & { stderr?: string };
+    throw new Error(`git ${args.join(" ")} failed: ${detail.stderr?.trim() || detail.message}`);
+  }
 }
 
 async function readSessionMetadata(inputPath: string): Promise<SessionMetadata> {
@@ -790,11 +1021,57 @@ function isPathInside(parent: string, child: string): boolean {
   return path === "" || path !== ".." && !path.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(path);
 }
 
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("PI_AGENT_VIEW_RPC_TIMEOUT_MS must be a positive integer");
+  return parsed;
+}
+
 function parseWorkerArgs(value: string | undefined): string[] {
   if (!value) return [];
   const parsed: unknown = JSON.parse(value);
   if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) throw new Error("PI_AGENT_VIEW_WORKER_ARGS must be a JSON string array");
   return parsed;
+}
+
+async function secureDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Supervisor state path is not a real directory: ${path}`);
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`Supervisor state path is not owned by the current user: ${path}`);
+  await chmod(path, 0o700);
+}
+
+async function assertUserOwnedFile(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Supervisor state file is not a regular file: ${path}`);
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`Supervisor state file is not owned by the current user: ${path}`);
+  if ((info.mode & 0o077) !== 0) throw new Error(`Supervisor state file permissions are too broad: ${path}`);
+}
+
+async function acquireSupervisorLock(lockPath: string): Promise<FileHandle> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+      await chmod(lockPath, 0o600);
+      return handle;
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+      let ownerPid: number | undefined;
+      try {
+        await assertUserOwnedFile(lockPath);
+        const value = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
+        if (typeof value.pid === "number") ownerPid = value.pid;
+      } catch (readCause) {
+        throw new Error(`Cannot validate existing supervisor lock: ${errorMessage(readCause)}`);
+      }
+      if (ownerPid && isProcessAlive(ownerPid)) throw new Error(`A supervisor already owns this registry (pid ${ownerPid})`);
+      await rm(lockPath, { force: true });
+    }
+  }
+  throw new Error("Could not acquire supervisor registry lock after removing a stale lock");
 }
 
 async function removeStaleSocket(socketPath: string): Promise<void> {
@@ -804,12 +1081,41 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
     socket.once("connect", () => { socket.destroy(); resolve(true); });
     socket.once("error", () => resolve(false));
   });
-  if (active) throw new Error("A supervisor already owns this registry");
+  if (active) throw new Error("A supervisor socket is active despite acquiring the registry lock");
   await rm(socketPath, { force: true });
+}
+
+async function terminateWorker(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  signalPid(child.pid, "SIGTERM");
+  if (await Promise.race([exited.then(() => true), delay(1_000).then(() => false)])) return;
+  signalPid(child.pid, "SIGKILL");
+  await Promise.race([exited, delay(1_000)]);
+}
+
+async function terminatePid(pid: number): Promise<void> {
+  signalPid(pid, "SIGTERM");
+  for (let index = 0; index < 20 && isProcessAlive(pid); index++) await delay(25);
+  if (isProcessAlive(pid)) signalPid(pid, "SIGKILL");
+}
+
+function signalPid(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) return;
+  try {
+    if (process.platform !== "win32") process.kill(-pid, signal);
+    else process.kill(pid, signal);
+  } catch {
+    try { process.kill(pid, signal); } catch { /* already exited */ }
+  }
 }
 
 function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

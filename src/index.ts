@@ -53,7 +53,9 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
       default: false,
     });
 
-    let enabled = Boolean(pi.getFlag("agent-mode"));
+    // Pi applies extension CLI flag values after loading extension factories.
+    // Read the startup flag at session_start, not during registration.
+    let enabled = false;
     let client: AgentViewSupervisor | undefined;
     let unsubscribe: (() => void) | undefined;
     let latest: SupervisorSnapshot | undefined;
@@ -192,8 +194,23 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
           if (name === undefined) continue;
           const prompt = await ctx.ui.input("Initial prompt", "optional; leave blank to launch idle");
           if (prompt === undefined) continue;
+          const isolationChoice = await ctx.ui.select("Checkout isolation", [
+            "Isolated Git worktree (recommended)",
+            "Shared checkout (unsafe for concurrent edits)",
+          ]);
+          if (!isolationChoice) continue;
+          const projectTrusted = await ctx.ui.confirm(
+            "Load project-local Pi resources?",
+            "Approve this worker to load project settings, extensions, skills, prompts, and themes? Approval applies only to this worker launch.",
+          );
           try {
-            await supervisor.launch({ cwd: cwdInput.trim() || action.cwd, name: name.trim() || undefined, prompt: prompt.trim() || undefined });
+            await supervisor.launch({
+              cwd: cwdInput.trim() || action.cwd,
+              name: name.trim() || undefined,
+              prompt: prompt.trim() || undefined,
+              isolation: isolationChoice.startsWith("Shared") ? "shared" : "required",
+              projectTrusted,
+            });
           } catch (cause) {
             ctx.ui.notify(`Could not launch thread: ${errorMessage(cause)}`, "error");
           }
@@ -202,6 +219,7 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
     });
 
     pi.on("session_start", async (_event, ctx) => {
+      if (Boolean(pi.getFlag("agent-mode"))) enabled = true;
       if (!enabled) return;
       try {
         await connect(ctx);
@@ -251,9 +269,14 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
             const marker = selected ? theme.fg("accent", ">") : " ";
             const state = thread.state === "needs-input" ? "needs input" : thread.state;
             const project = basename(thread.project) || thread.project;
-            const row = `${marker} ${theme.fg(stateColor(thread), state.padEnd(11))} ${theme.bold(thread.name)}  ${thread.activity ?? thread.lastEvent ?? ""}  ${theme.fg("dim", `${project} · ${relativeTime(thread.updatedAt)}`)}`;
+            const checkout = checkoutLabel(thread);
+            const row = `${marker} ${theme.fg(stateColor(thread), state.padEnd(11))} ${theme.bold(thread.name)}  ${thread.activity ?? thread.lastEvent ?? ""}  ${theme.fg("dim", `${project} · ${checkout} · ${relativeTime(thread.updatedAt)}`)}`;
             lines.push(`  ${row}`);
-            if (selected) lines.push(theme.fg(thread.error ? "error" : "dim", `      ${thread.error ?? thread.cwd}`));
+            if (selected) {
+              lines.push(theme.fg("dim", `      checkout: ${thread.checkout.path}  cwd: ${thread.cwd}`));
+              if (thread.error) lines.push(theme.fg("error", `      ${thread.error}`));
+              if (thread.checkout.warning) lines.push(theme.fg("warning", `      ${thread.checkout.warning}`));
+            }
           }
         }
         return lines.map((line) => truncateToWidth(line, Math.max(1, width)));
@@ -309,7 +332,7 @@ async function previewThread(ctx: ExtensionContext, supervisor: AgentViewSupervi
               : thread.recentOutput || thread.activity || "No output yet";
           const lines = [
             theme.fg("accent", theme.bold(thread.name)) + theme.fg("dim", `  ${thread.state}`),
-            theme.fg("dim", `${thread.project}  ·  ${thread.cwd}`),
+            theme.fg("dim", `${thread.project}  ·  ${checkoutLabel(thread)}: ${thread.checkout.path}`),
             "",
             ...content.split("\n"),
             "",
@@ -495,7 +518,16 @@ async function adoptSession(ctx: ExtensionContext, supervisor: AgentViewSupervis
     if (!session) return;
     const name = await ctx.ui.input("Thread name", session.name || session.firstMessage.slice(0, 80) || "optional");
     if (name === undefined) return;
-    await supervisor.adopt({ sessionFile: session.path, name: name.trim() || undefined });
+    const allowSharedCheckout = await ctx.ui.confirm(
+      "Use the session's saved checkout?",
+      "Adopted sessions cannot be moved transparently. If this is a Git session, it will share its saved checkout with other processes. Continue only if concurrent edits are safe.",
+    );
+    if (!allowSharedCheckout) return;
+    const projectTrusted = await ctx.ui.confirm(
+      "Load project-local Pi resources?",
+      "Approve this adopted worker to load project settings, extensions, skills, prompts, and themes? Approval applies only to this worker launch.",
+    );
+    await supervisor.adopt({ sessionFile: session.path, name: name.trim() || undefined, allowSharedCheckout, projectTrusted });
   } catch (cause) {
     ctx.ui.notify(`Could not adopt session: ${errorMessage(cause)}`, "error");
   }
@@ -527,7 +559,13 @@ function relativeTime(timestamp: string): string {
 
 function formatSnapshot(snapshot: SupervisorSnapshot): string {
   if (snapshot.threads.length === 0) return "No supervised threads";
-  return snapshot.threads.map((thread) => `${thread.state}: ${thread.name} — ${thread.activity ?? thread.cwd} (${thread.project})`).join("\n");
+  return snapshot.threads.map((thread) => `${thread.state}: ${thread.name} — ${thread.activity ?? thread.cwd} (${thread.project}; ${checkoutLabel(thread)} ${thread.checkout.path})`).join("\n");
+}
+
+function checkoutLabel(thread: ThreadSnapshot): string {
+  if (thread.checkout.mode === "worktree") return `worktree ${thread.checkout.branch ?? "isolated"}`;
+  if (thread.checkout.mode === "shared") return "shared checkout";
+  return "directory";
 }
 
 function errorMessage(cause: unknown): string {
