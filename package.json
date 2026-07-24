@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "A supervisor-backed multi-session agent view for Pi",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test test/*.test.ts",
     "check": "tsc --noEmit"
   },
   "keywords": [
@@ -38,5 +38,8 @@
   "bugs": {
     "url": "https://github.com/matisfogel99/pi-agent-view/issues"
   },
-  "homepage": "https://github.com/matisfogel99/pi-agent-view#readme"
+  "homepage": "https://github.com/matisfogel99/pi-agent-view#readme",
+  "dependencies": {
+    "tsx": "^4.23.1"
+  }
 }
