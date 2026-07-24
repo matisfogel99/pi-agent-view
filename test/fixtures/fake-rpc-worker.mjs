@@ -5,11 +5,13 @@ import { join } from "node:path";
 const args = process.argv.slice(2);
 const existingSession = valueAfter("--session");
 const sessionDir = valueAfter("--session-dir") ?? process.cwd();
-const name = valueAfter("--name") ?? "fake";
+const explicitName = valueAfter("--name");
+let name = explicitName ?? "fake";
+let autoNamePending = process.env.PI_AGENT_VIEW_AUTO_NAME === "1";
 if (process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG) appendFileSync(process.env.PI_AGENT_VIEW_FAKE_ARGS_LOG, `${JSON.stringify(args)}\n`);
 mkdirSync(sessionDir, { recursive: true });
 const sessionFile = existingSession ?? join(sessionDir, "fake-session.jsonl");
-if (!existingSession) writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), name })}\n`, { mode: 0o600 });
+if (!existingSession) writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), ...(explicitName ? { name } : {}) })}\n`, { mode: 0o600 });
 
 let buffer = "";
 let entrySequence = 0;
@@ -28,7 +30,7 @@ process.stdin.on("data", (chunk) => {
 
 function handle(command) {
   if (command.type === "get_state") {
-    send({ id: command.id, type: "response", command: "get_state", success: true, data: { sessionFile, sessionId: `fake-${process.pid}`, sessionName: name, isStreaming: false } });
+    send({ id: command.id, type: "response", command: "get_state", success: true, data: { sessionFile, sessionId: `fake-${process.pid}`, ...(explicitName ? { sessionName: name } : {}), isStreaming: false } });
     return;
   }
   if (command.type === "prompt") {
@@ -65,6 +67,12 @@ function handle(command) {
 
 function runPrompt(message) {
   queueMicrotask(() => {
+    if (autoNamePending) {
+      autoNamePending = false;
+      name = `AI: ${message}`.slice(0, 80);
+      appendFileSync(sessionFile, `${JSON.stringify({ type: "session_info", id: `entry-${process.pid}-${++entrySequence}`, parentId: null, timestamp: new Date().toISOString(), name })}\n`);
+      send({ type: "session_info_changed", name });
+    }
     send({ type: "agent_start" });
     send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "working on deterministic output" } });
     if (message === "wait" || message === "choose") {

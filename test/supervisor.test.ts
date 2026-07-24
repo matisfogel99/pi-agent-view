@@ -51,7 +51,7 @@ test("client automatically starts the user-local supervisor on first use", async
   const client = new SupervisorClient({ paths: getSupervisorPaths(stateDir), connectTimeoutMs: 4_000 });
   t.after(() => client.disconnect());
   const snapshot = await client.connect();
-  assert.equal(snapshot.protocolVersion, 4);
+  assert.equal(snapshot.protocolVersion, 5);
   assert.ok(snapshot.supervisorPid > 0);
   await client.shutdownSupervisor();
 });
@@ -94,6 +94,23 @@ test("real supervisor launches a persistent RPC worker and streams truthful life
   assert.equal((await stat(h.paths.socketPath)).mode & 0o777, 0o600);
   assert.equal((await stat(h.paths.sessionsDir)).mode & 0o777, 0o700);
   assert.equal((await stat(h.paths.worktreesDir)).mode & 0o777, 0o700);
+});
+
+test("an unnamed worker starts as New thread and adopts the agent-generated name after its first prompt", async (t) => {
+  const argsLog = join(await mkdtemp(join(tmpdir(), "pi-agent-view-name-")), "args.jsonl");
+  const h = await harness(t, { PI_AGENT_VIEW_FAKE_ARGS_LOG: argsLog });
+
+  const launched = await h.client.launch({ cwd: tmpdir(), projectTrusted: true });
+  assert.equal(launched.name, "New thread");
+  assert.equal(launched.namePending, true);
+
+  await h.client.sendMessage(launched.id, "prompt", "repair flaky tests");
+  const named = await waitForSnapshot(h.client, (thread) => thread.id === launched.id && thread.namePending === false);
+  assert.equal(named.name, "AI: repair flaky tests");
+
+  const workerArgs = JSON.parse((await readFile(argsLog, "utf8")).trim().split("\n")[0]!);
+  assert.ok(workerArgs.includes("--approve"));
+  assert.equal(workerArgs.includes("--name"), false, "placeholder names must not become persisted Pi session names");
 });
 
 test("supervisor reports worker failure without credentials or network access", async (t) => {
@@ -309,7 +326,7 @@ test("incompatible protocol versions are rejected clearly", async (t) => {
   const h = await harness(t);
   const incompatible = new SupervisorClient({ paths: h.paths, protocolVersion: 999, autoStart: false });
   t.after(() => incompatible.disconnect());
-  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 4/);
+  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 5/);
 });
 
 test("one supervisor owns the registry", async (t) => {

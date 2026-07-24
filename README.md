@@ -44,7 +44,7 @@ Or control it at runtime, including while the foreground agent is working:
 - `↑`/`↓` or `j`/`k`: select a thread
 - `Space`: preview live activity, recent output, failures, or an outstanding extension UI request
 - `Enter`: attach to the bounded live transcript
-- `n`: create and optionally name a persisted RPC thread
+- `n`: choose checkout isolation, then create and enter a persisted RPC thread in Pi's current working directory
 - `a`: adopt an existing persisted Pi session (duplicate ownership is rejected)
 - `x` / `R`: stop or resume without deleting the transcript or checkout
 - `d`: delete a stopped thread after confirmation
@@ -57,7 +57,7 @@ Each selected row and preview reports the actual checkout path and whether it is
 
 From preview, `r` replies to a ready thread or answers its outstanding select, confirm, input, or editor request. Failed delivery restores the user's text to Pi's editor. `Enter` attaches and `a` aborts only that worker.
 
-The takeover view reads durable session entries through stable cursors and retains at most 200 entries in client memory. Use `p` for a normal prompt, `s` to steer, `f` to queue a follow-up, `a` to abort that worker, arrows or `j`/`k` to scroll, `End` to follow the live tail, and `q` or Escape to detach without stopping it.
+The takeover view reads durable session entries through stable cursors and retains at most 200 entries in client memory. It includes a Pi-style editor: Enter sends a prompt or steers a running worker, Shift+Enter inserts a newline, Alt+Enter queues a follow-up, Escape aborts the worker, Page Up/Page Down scroll, and Ctrl+D detaches without stopping it. After the first prompt, the agent generates a concise thread name.
 
 ## Isolation and project trust
 
@@ -65,7 +65,7 @@ New threads in Git repositories use a managed worktree and dedicated `pi-agent-v
 
 Stopping preserves the checkout. Confirmed deletion removes a managed worktree only when it is present, clean, and still at its launch commit. Dirty worktrees, branches with later commits that may be unpushed, shared checkouts, and externally removed worktrees are preserved or reported with recovery details. Transcript deletion and checkout cleanup are reported separately.
 
-Every launch asks whether that worker may load project-local Pi resources. The answer is passed to that Pi RPC process as a one-run `--approve` or `--no-approve` decision. The safe default declines project settings, extensions, skills, prompts, and themes; approval is scoped to the selected worker and is not inferred merely from choosing a directory.
+New threads inherit Pi's current working directory and load its project-local settings, extensions, skills, prompts, and themes through a one-run `--approve` decision. Checkout isolation remains the single explicit launch choice. Approval is scoped to the selected worker. Adopted sessions retain an explicit trust confirmation because they may originate elsewhere.
 
 Git worktrees isolate repository files, not credentials, processes, network access, or non-repository paths. Use an OS sandbox, container, or VM for untrusted or unattended code.
 
@@ -87,7 +87,7 @@ The default state root is:
 
 It contains `supervisor.sock`, `supervisor.lock`, `registry.json`, `supervisor.log`, managed session directories, and managed worktrees. Directories are forced to mode `0700`; the socket, lock, registry, and log are mode `0600`. The supervisor rejects state files/directories not owned by the current user and does not provide remote or multi-user IPC.
 
-Supervisor protocol version 4 adds checkout/isolation metadata, scoped project trust, request replay protection, and hardened lifecycle behavior. Incompatible clients fail clearly rather than mutating state.
+Supervisor protocol version 5 adds AI-generated thread names and the attached Pi-style editor while retaining checkout/isolation metadata, scoped project trust, request replay protection, and hardened lifecycle behavior. Incompatible clients fail clearly rather than mutating state.
 
 ## Troubleshooting
 

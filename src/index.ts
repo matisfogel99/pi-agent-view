@@ -1,6 +1,7 @@
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Editor, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
+import { Type } from "typebox";
 import { DashboardController } from "./dashboard.ts";
 import type {
   AdoptThreadInput,
@@ -17,7 +18,7 @@ import { TranscriptController } from "./transcript.ts";
 
 const STATUS_KEY = "agent-view";
 type ViewAction =
-  | { type: "launch"; cwd: string }
+  | { type: "launch" }
   | { type: "adopt" }
   | { type: "stop"; id: string }
   | { type: "resume"; id: string }
@@ -47,6 +48,14 @@ type ClientFactory = () => AgentViewSupervisor;
 
 export function createAgentViewExtension(clientFactory: ClientFactory = () => new SupervisorClient()) {
   return function agentView(pi: ExtensionAPI): void {
+    if (process.env.PI_AGENT_VIEW_SUPERVISED_WORKER === "1") {
+      const automaticName = process.env.PI_AGENT_VIEW_AUTO_NAME === "1";
+      delete process.env.PI_AGENT_VIEW_SUPERVISED_WORKER;
+      delete process.env.PI_AGENT_VIEW_AUTO_NAME;
+      if (automaticName) registerAutomaticThreadNaming(pi);
+      return;
+    }
+
     pi.registerFlag("agent-mode", {
       description: "Enable the supervisor-backed agent view for this Pi client",
       type: "boolean",
@@ -188,29 +197,18 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
             continue;
           }
 
-          const cwdInput = await ctx.ui.input("Project working directory", action.cwd);
-          if (cwdInput === undefined) continue;
-          const name = await ctx.ui.input("Thread name", "optional");
-          if (name === undefined) continue;
-          const prompt = await ctx.ui.input("Initial prompt", "optional; leave blank to launch idle");
-          if (prompt === undefined) continue;
           const isolationChoice = await ctx.ui.select("Checkout isolation", [
             "Isolated Git worktree (recommended)",
             "Shared checkout (unsafe for concurrent edits)",
           ]);
           if (!isolationChoice) continue;
-          const projectTrusted = await ctx.ui.confirm(
-            "Load project-local Pi resources?",
-            "Approve this worker to load project settings, extensions, skills, prompts, and themes? Approval applies only to this worker launch.",
-          );
           try {
-            await supervisor.launch({
-              cwd: cwdInput.trim() || action.cwd,
-              name: name.trim() || undefined,
-              prompt: prompt.trim() || undefined,
+            const launched = await supervisor.launch({
+              cwd: ctx.cwd,
               isolation: isolationChoice.startsWith("Shared") ? "shared" : "required",
-              projectTrusted,
+              projectTrusted: true,
             });
+            await takeoverThread(ctx, supervisor, launched.id);
           } catch (cause) {
             ctx.ui.notify(`Could not launch thread: ${errorMessage(cause)}`, "error");
           }
@@ -235,6 +233,44 @@ export function createAgentViewExtension(clientFactory: ClientFactory = () => ne
 }
 
 export default createAgentViewExtension();
+
+function registerAutomaticThreadNaming(pi: ExtensionAPI): void {
+  const toolName = "set_agent_thread_name";
+  let named = false;
+  const deactivate = () => pi.setActiveTools(pi.getActiveTools().filter((name) => name !== toolName));
+
+  pi.registerTool({
+    name: toolName,
+    label: "Name thread",
+    description: "Set a concise display name for a newly supervised agent thread",
+    parameters: Type.Object({
+      title: Type.String({ minLength: 1, maxLength: 80, description: "A concise 2 to 6 word title for the user's task" }),
+    }),
+    async execute(_toolCallId, params) {
+      const title = params.title.replace(/\s+/g, " ").trim().slice(0, 80);
+      if (!title) throw new Error("Thread title cannot be empty");
+      pi.setSessionName(title);
+      named = true;
+      deactivate();
+      return {
+        content: [{ type: "text", text: `Thread named: ${title}` }],
+        details: { title },
+      };
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    named = Boolean(ctx.sessionManager.getSessionName());
+    if (named) deactivate();
+  });
+
+  pi.on("before_agent_start", (event) => {
+    if (named) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nThis is the first turn of a newly supervised thread. Once you understand the user's task, call ${toolName} exactly once with a concise 2 to 6 word title, then continue the task.`,
+    };
+  });
+}
 
 async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervisor, dashboard: DashboardController): Promise<ViewAction | undefined> {
   return await ctx.ui.custom<ViewAction>((tui, theme, _keybindings, done) => {
@@ -293,7 +329,7 @@ async function openDashboard(ctx: ExtensionContext, supervisor: AgentViewSupervi
         else if (data === "/") finish({ type: "search", query: dashboard.searchQuery() });
         else if ((matchesKey(data, Key.space)) && selected) finish({ type: "preview", id: selected.id });
         else if (matchesKey(data, Key.enter) && selected) finish({ type: "attach", id: selected.id });
-        else if (data === "n") finish({ type: "launch", cwd: selected?.cwd ?? ctx.cwd });
+        else if (data === "n") finish({ type: "launch" });
         else if (data === "a") finish({ type: "adopt" });
         else if (data === "x" && selected) finish({ type: "stop", id: selected.id });
         else if (data === "R" && selected) finish({ type: "resume", id: selected.id });
@@ -366,18 +402,40 @@ async function previewThread(ctx: ExtensionContext, supervisor: AgentViewSupervi
   }
 }
 
+type ThreadViewAction =
+  | { type: "detach" }
+  | { type: "abort" }
+  | { type: "answer" }
+  | { type: "message"; mode: ThreadMessageMode; message: string };
+
 async function takeoverThread(ctx: ExtensionContext, supervisor: AgentViewSupervisor, id: string): Promise<void> {
   const transcript = new TranscriptController(200);
+  let draft = "";
+  const history: string[] = [];
   try { transcript.applyPage(await supervisor.transcript(id, undefined, 100)); }
   catch (cause) { ctx.ui.notify(`Could not load transcript: ${errorMessage(cause)}`, "error"); return; }
 
   while (true) {
-    const action = await ctx.ui.custom<"detach" | "prompt" | "steer" | "followUp" | "abort">((tui, theme, _keys, done) => {
+    const action = await ctx.ui.custom<ThreadViewAction>((tui, theme, keybindings, done) => {
       let thread: ThreadSnapshot | undefined;
       let finished = false;
       let olderLoading = false;
       let refreshing = false;
       let refreshRequested = false;
+      const editor = new Editor(tui, {
+        borderColor: (text) => theme.fg(thread?.state === "working" ? "warning" : "borderAccent", text),
+        selectList: {
+          selectedPrefix: (text) => theme.fg("accent", text),
+          selectedText: (text) => theme.fg("accent", text),
+          description: (text) => theme.fg("muted", text),
+          scrollInfo: (text) => theme.fg("dim", text),
+          noMatch: (text) => theme.fg("warning", text),
+        },
+      }, { paddingX: 1 });
+      for (const value of history) editor.addToHistory(value);
+      editor.setText(draft);
+      editor.onChange = (value) => { draft = value; tui.requestRender(); };
+
       const refresh = () => {
         refreshRequested = true;
         if (refreshing) return;
@@ -408,46 +466,77 @@ async function takeoverThread(ctx: ExtensionContext, supervisor: AgentViewSuperv
       };
       const off = supervisor.onSnapshot((snapshot) => {
         thread = snapshot.threads.find((candidate) => candidate.id === id);
+        editor.disableSubmit = thread?.state !== "ready" && thread?.state !== "working";
         refresh();
         tui.requestRender();
       });
-      const finish = (value: "detach" | "prompt" | "steer" | "followUp" | "abort") => {
+      const finish = (value: ThreadViewAction) => {
         if (finished) return;
         finished = true;
         off();
         done(value);
       };
-      return {
+      const submit = (mode: ThreadMessageMode, value = editor.getExpandedText()) => {
+        const message = value.trim();
+        if (!message) return;
+        history.push(message);
+        draft = "";
+        finish({ type: "message", mode, message });
+      };
+      editor.onSubmit = (value) => submit(thread?.state === "working" ? "steer" : "prompt", value);
+
+      const view: Component & Focusable & { dispose(): void } = {
+        focused: true,
         render(width: number): string[] {
           const safeWidth = Math.max(1, width);
-          const rows = Math.max(4, tui.terminal.rows - 5);
-          const header = theme.fg("accent", theme.bold(thread?.name ?? "Thread")) + theme.fg("dim", `  ${thread?.state ?? "loading"}`);
+          const editorLines = editor.render(safeWidth);
+          const rows = Math.max(1, tui.terminal.rows - editorLines.length - 3);
+          const header = theme.fg("accent", theme.bold(thread?.name ?? "New thread"))
+            + theme.fg("dim", `  ${thread?.state ?? "loading"}  ${thread?.cwd ?? ""}`);
           const body = transcript.render(safeWidth, rows);
-          if (thread?.state === "working" && thread.recentOutput) body.push(...thread.recentOutput.split("\n").slice(-3).map((line) => theme.fg("muted", `stream> ${line}`)));
-          const help = theme.fg("dim", "p prompt  s steer  f follow-up  a abort  ↑/↓ scroll  End latest  q detach");
-          return [header, ...body.slice(-rows), help].map((line) => truncateToWidth(line, safeWidth));
+          if (thread?.state === "working" && thread.recentOutput) {
+            body.push(...thread.recentOutput.split("\n").slice(-3).map((line) => theme.fg("muted", `stream> ${line}`)));
+          }
+          const pending = thread?.pendingRequest ? "  Enter answer request" : "";
+          const help = theme.fg("dim", `Enter send  Shift+Enter newline  Alt+Enter follow-up  Esc abort  Ctrl+D detach${pending}`);
+          return [header, "", ...body.slice(-rows), ...editorLines, help]
+            .map((line) => truncateToWidth(line, safeWidth));
         },
-        invalidate() {},
+        invalidate() { editor.invalidate(); },
         dispose() { off(); },
         handleInput(data: string) {
-          if (data === "p") finish("prompt");
-          else if (data === "s") finish("steer");
-          else if (data === "f") finish("followUp");
-          else if (data === "a") finish("abort");
-          else if (matchesKey(data, Key.up) || data === "k") { transcript.scroll(1); loadOlder(); }
-          else if (matchesKey(data, Key.down) || data === "j") transcript.scroll(-1);
-          else if (matchesKey(data, Key.end)) transcript.followLatest();
-          else if (data === "q" || matchesKey(data, Key.escape)) finish("detach");
+          if (thread?.pendingRequest && keybindings.matches(data, "tui.input.submit")) finish({ type: "answer" });
+          else if (keybindings.matches(data, "app.message.followUp")) submit("followUp");
+          else if (keybindings.matches(data, "app.interrupt") && thread?.state === "working") finish({ type: "abort" });
+          else if (keybindings.matches(data, "app.exit") && !editor.getText()) finish({ type: "detach" });
+          else if (matchesKey(data, Key.pageUp)) { transcript.scroll(10); loadOlder(); }
+          else if (matchesKey(data, Key.pageDown)) transcript.scroll(-10);
+          else editor.handleInput(data);
           tui.requestRender();
         },
       };
+      Object.defineProperty(view, "focused", {
+        get: () => editor.focused,
+        set: (value: boolean) => { editor.focused = value; },
+      });
+      return view;
     });
-    if (!action || action === "detach") return;
-    if (action === "abort") {
+    if (!action || action.type === "detach") return;
+    if (action.type === "abort") {
       await supervisor.abort(id).catch((cause) => ctx.ui.notify(`Could not abort worker: ${errorMessage(cause)}`, "error"));
       continue;
     }
-    await collectAndDeliver(ctx, supervisor, id, action, action === "followUp" ? "Queue follow-up" : action === "steer" ? "Steer running thread" : "Prompt thread");
+    if (action.type === "answer") {
+      const snapshot = await supervisor.snapshot();
+      const thread = snapshot.threads.find((candidate) => candidate.id === id);
+      if (thread?.pendingRequest) await answerPendingRequest(ctx, supervisor, thread);
+      continue;
+    }
+    try { await supervisor.sendMessage(id, action.mode, action.message); }
+    catch (cause) {
+      draft = action.message;
+      ctx.ui.notify(`Input was not delivered and remains in this thread's editor: ${errorMessage(cause)}`, "error");
+    }
   }
 }
 

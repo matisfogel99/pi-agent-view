@@ -267,13 +267,15 @@ export class SupervisorServer {
     const id = randomUUID();
     const prepared = await prepareCheckout(selectedCwd, id, this.paths.worktreesDir, input.isolation ?? "required");
     const now = new Date().toISOString();
-    const name = input.name?.trim() || firstUsefulLine(input.prompt ?? "") || `${basename(prepared.project) || "Project"} thread ${this.records.size + 1}`;
+    const requestedName = input.name?.trim();
+    const name = requestedName || "New thread";
     const sessionDir = join(this.paths.sessionsDir, id);
     await secureDirectory(sessionDir);
 
     const record: ThreadSnapshot = {
-      id, cwd: prepared.cwd, project: prepared.project, name, state: "starting", sessionOrigin: "created",
-      checkout: prepared.checkout, projectTrusted: input.projectTrusted === true,
+      id, cwd: prepared.cwd, project: prepared.project, name, namePending: !requestedName,
+      state: "starting", sessionOrigin: "created", checkout: prepared.checkout,
+      projectTrusted: input.projectTrusted === true,
       createdAt: now, updatedAt: now, lastEvent: "worker spawning", activity: "Starting worker",
     };
     this.records.set(id, record);
@@ -341,10 +343,14 @@ export class SupervisorServer {
     record.activity = "Starting worker";
     record.error = undefined;
     const trustArg = record.projectTrusted ? "--approve" : "--no-approve";
-    const args = [...this.workerArgs, "--mode", "rpc", trustArg, ...sessionArgs, "--name", record.name];
+    const nameArgs = record.namePending ? [] : ["--name", record.name];
+    const args = [...this.workerArgs, "--mode", "rpc", trustArg, ...sessionArgs, ...nameArgs];
+    const env: NodeJS.ProcessEnv = { ...process.env, PI_AGENT_VIEW_SUPERVISED_WORKER: "1" };
+    if (record.namePending) env.PI_AGENT_VIEW_AUTO_NAME = "1";
+    else delete env.PI_AGENT_VIEW_AUTO_NAME;
     const child = spawn(this.workerCommand, args, {
       cwd: record.cwd,
-      env: process.env,
+      env,
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -386,6 +392,10 @@ export class SupervisorServer {
         record.sessionFile = sessionFile;
       }
       if (typeof data?.sessionId === "string") record.sessionId = data.sessionId;
+      if (record.namePending && typeof data?.sessionName === "string" && data.sessionName.trim()) {
+        record.name = data.sessionName.trim();
+        record.namePending = false;
+      }
       if (!record.sessionFile) throw new Error("Worker did not provide a persisted session file");
       this.update(record, "ready", "worker ready", record.transcriptMetadata ? "Session ready" : "Ready for a prompt");
       if (prompt?.trim()) await this.rpc(worker, { type: "prompt", message: prompt.trim() });
@@ -611,6 +621,10 @@ export class SupervisorServer {
     else if (event === "agent_settled") {
       worker.record.pendingRequest = undefined;
       if (worker.record.state !== "failed" && worker.record.state !== "stopped") this.update(worker.record, "ready", event, worker.record.activity ?? "Ready");
+    } else if (event === "session_info_changed" && typeof value.name === "string" && value.name.trim()) {
+      worker.record.name = value.name.trim();
+      worker.record.namePending = false;
+      this.update(worker.record, worker.record.state, event, worker.record.activity ?? "Thread named");
     } else if (event === "extension_ui_request" && expectsUiResponse(value)) {
       worker.record.pendingRequest = pendingUiRequest(value);
       this.update(worker.record, "needs-input", event, activity ?? "Waiting for input");

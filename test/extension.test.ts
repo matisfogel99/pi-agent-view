@@ -11,7 +11,7 @@ function setup(flag = false) {
   let disconnects = 0;
   let stops = 0;
   let customViews = 0;
-  const snapshot: SupervisorSnapshot = { protocolVersion: 4, supervisorPid: 123, threads: [] };
+  const snapshot: SupervisorSnapshot = { protocolVersion: 5, supervisorPid: 123, threads: [] };
   const client: AgentViewSupervisor = {
     async connect() { connects++; return snapshot; },
     disconnect() { disconnects++; },
@@ -89,4 +89,40 @@ test("startup flag connects lazily at session start and shutdown only disconnect
   await h.events.get("session_shutdown")!({}, h.ctx);
   assert.equal(h.counts().disconnects, 1);
   assert.equal(h.counts().stops, 0);
+});
+
+test("supervised workers ask the agent to name the thread once on its first turn", async () => {
+  const previousWorker = process.env.PI_AGENT_VIEW_SUPERVISED_WORKER;
+  const previousAutoName = process.env.PI_AGENT_VIEW_AUTO_NAME;
+  process.env.PI_AGENT_VIEW_SUPERVISED_WORKER = "1";
+  process.env.PI_AGENT_VIEW_AUTO_NAME = "1";
+  try {
+    const events = new Map<string, (event: any, ctx: any) => any>();
+    let tool: any;
+    let sessionName: string | undefined;
+    let activeTools = ["read", "set_agent_thread_name"];
+    const pi = {
+      registerTool(value: any) { tool = value; },
+      on(name: string, handler: (event: any, ctx: any) => any) { events.set(name, handler); },
+      setSessionName(value: string) { sessionName = value; },
+      getActiveTools() { return activeTools; },
+      setActiveTools(value: string[]) { activeTools = value; },
+    };
+
+    createAgentViewExtension(() => { throw new Error("worker must not connect to the supervisor as a dashboard client"); })(pi as any);
+    await events.get("session_start")!({}, { sessionManager: { getSessionName: () => undefined } });
+    const promptPatch = await events.get("before_agent_start")!({ systemPrompt: "base" }, {});
+    assert.match(promptPatch.systemPrompt, /set_agent_thread_name exactly once/);
+
+    const result = await tool.execute("call-1", { title: "  Repair   flaky tests  " });
+    assert.equal(sessionName, "Repair flaky tests");
+    assert.deepEqual(result.details, { title: "Repair flaky tests" });
+    assert.deepEqual(activeTools, ["read"]);
+    assert.equal(await events.get("before_agent_start")!({ systemPrompt: "base" }, {}), undefined);
+  } finally {
+    if (previousWorker === undefined) delete process.env.PI_AGENT_VIEW_SUPERVISED_WORKER;
+    else process.env.PI_AGENT_VIEW_SUPERVISED_WORKER = previousWorker;
+    if (previousAutoName === undefined) delete process.env.PI_AGENT_VIEW_AUTO_NAME;
+    else process.env.PI_AGENT_VIEW_AUTO_NAME = previousAutoName;
+  }
 });

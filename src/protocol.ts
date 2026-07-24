@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export type ThreadState = "starting" | "working" | "needs-input" | "ready" | "failed" | "stopped";
 export type SessionOrigin = "created" | "adopted";
@@ -33,6 +33,8 @@ export interface ThreadSnapshot {
   cwd: string;
   project: string;
   name: string;
+  /** True until the supervised agent generates a title from its first prompt. */
+  namePending?: boolean;
   state: ThreadState;
   pid?: number;
   sessionFile?: string;

@@ -20,7 +20,7 @@ function thread(overrides: Partial<ThreadSnapshot> & Pick<ThreadSnapshot, "id" |
 
 class InMemorySupervisor implements AgentViewSupervisor {
   private listeners = new Set<(snapshot: SupervisorSnapshot) => void>();
-  readonly data: SupervisorSnapshot = { protocolVersion: 4, supervisorPid: 42, threads: [] };
+  readonly data: SupervisorSnapshot = { protocolVersion: 5, supervisorPid: 42, threads: [] };
   async connect() { return this.snapshot(); }
   disconnect() {}
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
