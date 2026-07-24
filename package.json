@@ -1,8 +1,7 @@
 {
   "name": "pi-agent-view",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "A supervisor-backed multi-session agent view for Pi",
-  "main": "index.js",
   "scripts": {
     "test": "node --test",
     "check": "tsc --noEmit"
@@ -12,7 +11,7 @@
     "pi-coding-agent",
     "agent-view"
   ],
-  "author": "",
+  "author": "Matis",
   "license": "MIT",
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.82.0",
@@ -22,7 +21,6 @@
     "typescript": "^7.0.2"
   },
   "type": "module",
-  "private": "false",
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -32,5 +30,13 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matisfogel99/pi-agent-view.git"
+  },
+  "bugs": {
+    "url": "https://github.com/matisfogel99/pi-agent-view/issues"
+  },
+  "homepage": "https://github.com/matisfogel99/pi-agent-view#readme"
 }
