@@ -10,14 +10,18 @@ function setup(flag = false) {
   let connects = 0;
   let disconnects = 0;
   let stops = 0;
-  const snapshot: SupervisorSnapshot = { protocolVersion: 1, supervisorPid: 123, threads: [] };
+  let customViews = 0;
+  const snapshot: SupervisorSnapshot = { protocolVersion: 2, supervisorPid: 123, threads: [] };
   const client: AgentViewSupervisor = {
     async connect() { connects++; return snapshot; },
     disconnect() { disconnects++; },
     onSnapshot(listener) { listener(snapshot); return () => undefined; },
     async snapshot() { return snapshot; },
     async launch() { throw new Error("not used"); },
+    async adopt() { throw new Error("not used"); },
     async stop() { stops++; return {} as ThreadSnapshot; },
+    async resume() { throw new Error("not used"); },
+    async delete() { throw new Error("not used"); },
   };
   const pi = {
     registerFlag(name: string, options: unknown) { registeredFlag = { name, options }; },
@@ -38,11 +42,11 @@ function setup(flag = false) {
       theme: { fg: (_color: string, text: string) => text },
       notify: (message: string, type: string) => notifications.push({ message, type }),
       setStatus: (_key: string, value: unknown) => statuses.push(value),
-      custom: async () => ({ type: "close" }),
+      custom: async () => { customViews++; return { type: "close" }; },
       input: async () => undefined,
     },
   };
-  return { commands, events, registeredFlag, notifications, statuses, ctx, counts: () => ({ connects, disconnects, stops }) };
+  return { commands, events, registeredFlag, notifications, statuses, ctx, counts: () => ({ connects, disconnects, stops, customViews }) };
 }
 
 test("mode controls and helpful threads guidance remain safe during a foreground turn", async () => {
@@ -56,6 +60,9 @@ test("mode controls and helpful threads guidance remain safe during a foreground
   await h.commands.get("agent-mode")!.handler("on", h.ctx);
   assert.equal(h.counts().connects, 1);
   assert.match(h.notifications.at(-1)!.message, /enabled/);
+
+  await h.commands.get("threads")!.handler("", h.ctx);
+  assert.equal(h.counts().customViews, 1, "the full-screen dashboard must open without waiting for the foreground turn");
 
   await h.commands.get("agent-mode")!.handler("status", h.ctx);
   assert.match(h.notifications.at(-1)!.message, /is on/);

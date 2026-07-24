@@ -3,11 +3,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const args = process.argv.slice(2);
+const existingSession = valueAfter("--session");
 const sessionDir = valueAfter("--session-dir") ?? process.cwd();
 const name = valueAfter("--name") ?? "fake";
 mkdirSync(sessionDir, { recursive: true });
-const sessionFile = join(sessionDir, "fake-session.jsonl");
-writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: `fake-${process.pid}`, name })}\n`, { mode: 0o600 });
+const sessionFile = existingSession ?? join(sessionDir, "fake-session.jsonl");
+if (!existingSession) writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: `fake-${process.pid}`, cwd: process.cwd(), name })}\n`, { mode: 0o600 });
 
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -31,8 +32,10 @@ function handle(command) {
     send({ id: command.id, type: "response", command: "prompt", success: true });
     queueMicrotask(() => {
       send({ type: "agent_start" });
-      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "working" } });
-      if (command.message === "fail") {
+      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "working on deterministic output" } });
+      if (command.message === "wait") {
+        send({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Continue?", message: "Waiting" });
+      } else if (command.message === "fail") {
         send({ type: "message_end", message: { role: "assistant", stopReason: "error" } });
         send({ type: "agent_settled" });
       } else if (command.message === "crash") {

@@ -24,7 +24,21 @@ Or control it at runtime (including while the foreground agent is working):
 /agent-mode off
 ```
 
-`/threads` opens the minimal full-screen thread view. Press `n` to choose a working directory, name, and optional initial prompt for a persisted Pi RPC worker. Use arrows or `j`/`k` to select a thread, `x` to stop it, and `q` or Escape to close the view.
+`/threads` opens the full-screen cross-project dashboard immediately, including while the foreground agent is streaming. Threads are grouped by canonical Git root or working directory and update live without losing the selected thread.
+
+Dashboard controls:
+
+- `↑`/`↓` or `j`/`k`: select a thread
+- `n`: create and optionally name a persisted RPC thread in the selected project
+- `a`: adopt an existing persisted Pi session (duplicate ownership is rejected)
+- `x` / `R`: stop or resume a thread without deleting its transcript
+- `d`: delete a stopped thread after confirmation; adopted or otherwise unsafe data is reported and preserved
+- `/`: search names, projects, activity, and bounded transcript metadata
+- `g` / `s`: toggle attention grouping or sorting
+- `h`/`l` or `←`/`→`: collapse or expand a project
+- `q` or Escape: close the dashboard
+
+Grouping, sorting, and project expansion choices remain in place when the dashboard is reopened in the current Pi client.
 
 Turning agent mode off, closing the view, or exiting the foreground Pi client only disconnects that client. It does not stop supervised workers. A later `pi --agent-mode` reconnects to the same user-local supervisor and registry.
 
@@ -36,7 +50,7 @@ The supervisor stores its Unix socket, restrictive-permission registry, and work
 ~/.pi/agent/pi-agent-view/
 ```
 
-The supervisor starts automatically when agent mode first needs it. After an unclean supervisor restart, records whose live RPC connection cannot be proven are marked failed rather than incorrectly shown as working; their persisted session path remains available for recovery.
+The supervisor starts automatically when agent mode first needs it. After an unclean supervisor restart, records whose live RPC connection cannot be proven are marked failed rather than incorrectly shown as working; their persisted session path remains available for recovery. Supervisor protocol version 2 adds adoption and lifecycle controls and rejects incompatible clients clearly.
 
 ## Development
 

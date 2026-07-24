@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, mkdtemp, readFile, stat } from "node:fs/promises";
+import { access, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +48,7 @@ test("client automatically starts the user-local supervisor on first use", async
   const client = new SupervisorClient({ paths: getSupervisorPaths(stateDir), connectTimeoutMs: 4_000 });
   t.after(() => client.disconnect());
   const snapshot = await client.connect();
-  assert.equal(snapshot.protocolVersion, 1);
+  assert.equal(snapshot.protocolVersion, 2);
   assert.ok(snapshot.supervisorPid > 0);
   await client.shutdownSupervisor();
 });
@@ -98,11 +98,50 @@ test("supervisor reports worker failure without credentials or network access", 
   await h.client.stop(launched.id);
 });
 
+test("adoption, duplicate ownership, needs-input, resume, and safe deletion work through the client interface", async (t) => {
+  const h = await harness(t);
+  const sessionDir = await mkdtemp(join(tmpdir(), "pi-agent-view-existing-"));
+  const sessionFile = join(sessionDir, "existing.jsonl");
+  await writeFile(sessionFile, [
+    JSON.stringify({ type: "session", version: 3, id: "existing-session", cwd: tmpdir(), timestamp: new Date().toISOString() }),
+    JSON.stringify({ type: "session_info", id: "name", parentId: null, timestamp: new Date().toISOString(), name: "Existing work" }),
+    JSON.stringify({ type: "message", id: "message", parentId: "name", timestamp: new Date().toISOString(), message: { role: "user", content: "metadata needle" } }),
+    "",
+  ].join("\n"));
+
+  const adopted = await h.client.adopt({ sessionFile });
+  assert.equal(adopted.name, "Existing work");
+  assert.equal(adopted.sessionOrigin, "adopted");
+  assert.match(adopted.transcriptMetadata ?? "", /metadata needle/);
+  await assert.rejects(h.client.adopt({ sessionFile }), /already owned/);
+
+  const waiting = await h.client.launch({ cwd: tmpdir(), name: "Waiting", prompt: "wait" });
+  const needsInput = await waitForSnapshot(h.client, (thread) => thread.id === waiting.id && thread.state === "needs-input");
+  assert.match(needsInput.activity ?? "", /Waiting/);
+
+  await h.client.stop(adopted.id);
+  const resumed = await waitFor(() => h.client.resume(adopted.id), 3_000);
+  assert.equal(resumed.id, adopted.id);
+  assert.equal(resumed.sessionFile, sessionFile);
+  await h.client.stop(adopted.id);
+  await assert.rejects(h.client.delete(adopted.id, false), /explicit confirmation/);
+  const deleted = await waitFor(() => h.client.delete(adopted.id, true), 3_000);
+  assert.equal(deleted.recordRemoved, true);
+  assert.equal(deleted.transcriptDeleted, false);
+  assert.deepEqual(deleted.preservedPaths, [sessionFile]);
+  await access(sessionFile);
+
+  await h.client.stop(waiting.id);
+  const managedDeletion = await waitFor(() => h.client.delete(waiting.id, true), 3_000);
+  assert.equal(managedDeletion.transcriptDeleted, true);
+  await assert.rejects(access(waiting.sessionFile!));
+});
+
 test("incompatible protocol versions are rejected clearly", async (t) => {
   const h = await harness(t);
   const incompatible = new SupervisorClient({ paths: h.paths, protocolVersion: 999, autoStart: false });
   t.after(() => incompatible.disconnect());
-  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 1/);
+  await assert.rejects(incompatible.connect(), /Incompatible supervisor protocol: client 999, server 2/);
 });
 
 test("one supervisor owns the registry", async (t) => {

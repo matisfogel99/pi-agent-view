@@ -7,7 +7,9 @@ import { encodeJsonLine, readJsonLines } from "./jsonl.ts";
 import { getSupervisorPaths, type SupervisorPaths } from "./paths.ts";
 import {
   PROTOCOL_VERSION,
+  type AdoptThreadInput,
   type ClientRequest,
+  type DeleteThreadResult,
   type LaunchThreadInput,
   type ServerResponse,
   type SupervisorSnapshot,
@@ -92,8 +94,20 @@ export class SupervisorClient {
     return await this.request("launch", input) as ThreadSnapshot;
   }
 
+  async adopt(input: AdoptThreadInput): Promise<ThreadSnapshot> {
+    return await this.request("adopt", input) as ThreadSnapshot;
+  }
+
   async stop(id: string): Promise<ThreadSnapshot> {
     return await this.request("stop", { id }) as ThreadSnapshot;
+  }
+
+  async resume(id: string): Promise<ThreadSnapshot> {
+    return await this.request("resume", { id }) as ThreadSnapshot;
+  }
+
+  async delete(id: string, confirmed: boolean): Promise<DeleteThreadResult> {
+    return await this.request("delete", { id, confirmed }) as DeleteThreadResult;
   }
 
   async shutdownSupervisor(): Promise<void> {
